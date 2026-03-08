@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "whispero"
+version = "0.1.0"
+description = "Push-to-talk desktop dictation app. Hold hotkey, speak, release, text appears."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Parker Cai" }]
+dependencies = [
+  "sounddevice",
+  "numpy",
+  "requests",
+  "faster-whisper>=1.1.0",
+  "pynput",
+  "pyperclip",
+  "pystray",
+  "Pillow",
+  "pywin32; platform_system == 'Windows'",
+  "pyobjc-framework-AppKit; platform_system == 'Darwin'",
+  "pyobjc-framework-Foundation; platform_system == 'Darwin'",
+]
+
+[project.urls]
+Homepage = "https://github.com/parkercai/whispero"
+Issues = "https://github.com/parkercai/whispero/issues"
+
+[project.scripts]
+whispero = "whispero.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
