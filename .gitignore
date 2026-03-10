@@ -34,3 +34,5 @@ Thumbs.db
 
 # Drafts
 icon_drafts/
+build/lib/
+build/lib/
