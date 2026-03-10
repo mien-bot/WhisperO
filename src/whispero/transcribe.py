@@ -62,6 +62,27 @@ def get_model(model_size: str = "large-v3"):
         download_root=str(get_model_cache_dir()),
     )
     _model_size = model_size
+
+    # Log device info
+    try:
+        import ctranslate2
+        cuda_available = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        cuda_available = False
+
+    if device == "cpu" or (device == "auto" and not cuda_available):
+        device_label = "CPU"
+    else:
+        device_label = "GPU"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device_label = f"GPU ({torch.cuda.get_device_name(0)})"
+        except Exception:
+            pass
+
+    print(f"  😮 Model: {model_size} | Device: {device_label}")
+
     return _model
 
 

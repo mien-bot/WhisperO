@@ -17,7 +17,14 @@ from .dictionary import load_dictionary, open_dictionary
 from .sounds import play_sound
 from .transcribe import transcribe
 
-signal.signal(signal.SIGINT, lambda *_: (print("\n👋 Bye!"), os._exit(0)))
+
+def _shutdown(*_):
+    print("\n  😮 Stopping WhisperO...")
+    os._exit(0)
+
+
+signal.signal(signal.SIGINT, _shutdown)
+signal.signal(signal.SIGTERM, _shutdown)
 
 config = load_config()
 state = RecorderState()
@@ -62,7 +69,11 @@ def _dictionary_seed_path() -> Path:
 
 
 def _play_sound(name: str) -> None:
-    play_sound(name=name, sounds_enabled=bool(config.get("sounds", True)), sounds_dir=_sounds_dir())
+    play_sound(
+        name=name,
+        sounds_enabled=bool(config.get("sounds", True)),
+        sounds_dir=_sounds_dir(),
+    )
 
 
 def get_trigger_keys() -> set:
@@ -91,7 +102,7 @@ def on_hotkey_release() -> None:
         prompt = load_dictionary(seed_path=_dictionary_seed_path())
         text = transcribe(audio_buf=audio_buf, config=config, prompt=prompt)
         if text:
-            print(f"  📝 \"{text}\"")
+            print(f'  📝 "{text}"')
             paste_text(text)
             print("  ✅ Pasted!")
         else:
@@ -153,12 +164,14 @@ def create_tray_icon():
             if config.get("backend", "local") == "local":
                 try:
                     from .transcribe import get_model, is_model_cached
+
                     if not is_model_cached(model_name):
                         print(f"  ⏳ Downloading {model_name}...")
                     get_model(model_name)
                     print(f"  ✓ {model_name} ready")
                 except Exception as e:
                     print(f"  ❌ Failed to load {model_name}: {e}")
+
         return callback
 
     def is_current_model(model_name):
@@ -170,15 +183,20 @@ def create_tray_icon():
         hotkey_label = "Hold Win+Ctrl to dictate"
 
     model_menu = pystray.Menu(
-        *[pystray.MenuItem(
-            m, make_model_callback(m), checked=is_current_model(m), radio=True
-        ) for m in MODELS]
+        *[
+            pystray.MenuItem(
+                m, make_model_callback(m), checked=is_current_model(m), radio=True
+            )
+            for m in MODELS
+        ]
     )
 
     menu = pystray.Menu(
         pystray.MenuItem(hotkey_label, None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(lambda item: "✓ Enabled" if state.enabled else "  Disabled", on_toggle),
+        pystray.MenuItem(
+            lambda item: "✓ Enabled" if state.enabled else "  Disabled", on_toggle
+        ),
         pystray.MenuItem("Select Model", model_menu),
         pystray.MenuItem("Edit Dictionary", on_edit_dict),
         pystray.Menu.SEPARATOR,
@@ -195,6 +213,7 @@ def main() -> None:
     if backend == "local":
         try:
             from .transcribe import get_model, is_model_cached
+
             model_name = config.get("model", "large-v3")
             print(f"😮 WhisperO (local, model: {model_name})")
             if not is_model_cached(model_name):
@@ -257,6 +276,7 @@ def main() -> None:
             listener.join()
         except KeyboardInterrupt:
             print("\n👋 Bye!")
+            _shutdown()
 
 
 if __name__ == "__main__":
