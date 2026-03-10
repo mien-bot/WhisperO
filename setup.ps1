@@ -60,8 +60,8 @@ if (-not $RepoDir) {
     $RepoDir = "$WhisperOHome\src"
     if (Test-Path "$RepoDir\.git") {
         Info "Updating existing clone..."
-        git -C $RepoDir pull --ff-only 2>$null
-        if (-not $?) { Warn "Could not update, using existing version" }
+        $pullOutput = & git -C $RepoDir pull --ff-only 2>&1
+        if ($LASTEXITCODE -ne 0) { Warn "Could not update, using existing version" }
     } else {
         Info "Cloning WhisperO..."
         git clone "https://github.com/parkercai/whispero.git" $RepoDir
