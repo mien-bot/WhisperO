@@ -89,12 +89,12 @@ if (Test-Path $VenvDir) {
 }
 
 # --- Install WhisperO ---
-$pip = "$VenvDir\Scripts\pip.exe"
+$venvPython = "$VenvDir\Scripts\python.exe"
 $whisperoExe = "$VenvDir\Scripts\whispero.exe"
 
 Info "Installing WhisperO and dependencies (this may take a few minutes)..."
-& $pip install --upgrade pip --quiet
-& $pip install $RepoDir --quiet
+& $venvPython -m pip install --upgrade pip --quiet 2>$null
+& $venvPython -m pip install $RepoDir --quiet
 Ok "WhisperO installed"
 
 # --- Add to PATH ---
