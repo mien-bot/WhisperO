@@ -99,7 +99,7 @@ def transcribe_server(audio_buf: io.BytesIO, server: str, prompt: str = "") -> s
             f"{server}/inference",
             files={"file": ("audio.wav", audio_buf, "audio/wav")},
             data=post_data,
-            timeout=30,
+            timeout=(3, 30),  # 3s connect, 30s read
         )
         resp.raise_for_status()
         return resp.text.strip()
