@@ -11,6 +11,7 @@ import requests
 
 _model = None
 _model_size: str | None = None
+_last_working_server: str | None = None
 
 
 def get_model_cache_dir() -> Path:
@@ -150,14 +151,25 @@ def transcribe(
     backend_name = (backend or cfg.get("backend") or ("server" if server else "local")).lower()
 
     if backend_name == "server":
+        global _last_working_server
         server_url = server or cfg.get("server", "http://localhost:8080")
-        servers = [server_url] + cfg.get("fallback_servers", [])
+        all_servers = [server_url] + cfg.get("fallback_servers", [])
+
+        # Try last working server first, then the rest
+        if _last_working_server and _last_working_server in all_servers:
+            servers = [_last_working_server] + [s for s in all_servers if s != _last_working_server]
+        else:
+            servers = all_servers
+
         for url in servers:
             audio_buf.seek(0)
             result = transcribe_server(audio_buf=audio_buf, server=url, prompt=prompt)
             if result is not None:
+                _last_working_server = url
                 return result
+
         # All servers unreachable — fall back to local
+        _last_working_server = None
         print("  ⚡ All servers unavailable, falling back to local...")
         audio_buf.seek(0)
         resolved_model = model_size or cfg.get("model", "large-v3")

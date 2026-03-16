@@ -175,7 +175,23 @@ def create_tray_icon():
         ) for m in MODELS]
     )
 
-    server_url = config.get("server", "http://localhost:8080")
+    # Build server list from config (deduplicated, stable order)
+    _all_servers = list(dict.fromkeys(
+        [config.get("server", "http://localhost:8080")] + config.get("fallback_servers", [])
+    ))
+
+    def make_server_callback(url):
+        def callback(icon, item):
+            config["backend"] = "server"
+            config["server"] = url
+            save_config_value("backend", "server")
+            save_config_value("server", url)
+            print(f"  🔄 Server: {url}")
+            icon.update_menu()
+        return callback
+
+    def is_current_server(url):
+        return lambda item: config.get("backend", "local") == "server" and config.get("server") == url
 
     def make_backend_callback(backend_name):
         def callback(icon, item):
@@ -197,10 +213,10 @@ def create_tray_icon():
                 "Local", make_backend_callback("local"),
                 checked=is_current_backend("local"), radio=True
             ),
-            pystray.MenuItem(
-                f"Server ({server_url})", make_backend_callback("server"),
-                checked=is_current_backend("server"), radio=True
-            ),
+            *[pystray.MenuItem(
+                f"Server ({s})", make_server_callback(s),
+                checked=is_current_server(s), radio=True
+            ) for s in _all_servers],
         )),
         pystray.MenuItem(
             "Select Model", model_menu,
