@@ -12,7 +12,19 @@ DEFAULTS = {
     "model": "large-v3",
     "hotkey": {"windows": ["win", "ctrl"], "mac": ["cmd", "ctrl"]},
     "sounds": True,
+    "start_sound": "start",
+    "stop_sound": "stop",
 }
+
+SOUND_OPTIONS = [
+    "start", "stop", "beep_high", "beep_low", "pop", "chime", "click", "ding",
+    "duck", "fart", "seven_eleven", "boing", "laser", "coin", "horn",
+    "whoosh", "bruh", "sparkle", "vine_boom",
+    "cha_ching", "boom", "scratch", "sad_trombone", "suspense", "wrong_buzzer",
+    "correct", "bonk", "emotional_damage", "rizz", "slide_whistle", "bell",
+    "metal_pipe", "yeet", "siren", "windows_error",
+    "none",
+]
 
 VALID_BACKENDS = {"local", "server"}
 VALID_MODELS = {"large-v3", "medium", "small", "base", "tiny"}

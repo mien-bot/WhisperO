@@ -33,6 +33,13 @@ def is_model_cached(model_size: str = "large-v3") -> bool:
     return snapshots_dir.exists() and any(path.is_file() for path in snapshots_dir.rglob("*"))
 
 
+def download_model(model_size: str = "large-v3") -> None:
+    """Download the model files without loading into memory."""
+    from faster_whisper.utils import download_model as _dl
+    cache_dir = str(get_model_cache_dir())
+    _dl(model_size, cache_dir=cache_dir)
+
+
 def get_model(model_size: str = "large-v3"):
     global _model, _model_size
 
@@ -46,22 +53,20 @@ def get_model(model_size: str = "large-v3"):
             "faster-whisper is not installed. Run `pip install faster-whisper`."
         ) from err
 
-    # PyInstaller frozen builds segfault on CTranslate2 CUDA init.
-    # Use CPU in .exe, GPU works from `python -m whispero`.
-    is_frozen = getattr(sys, "frozen", False)
-    if is_frozen:
-        device = "cpu"
-        compute = "auto"
-    else:
-        device = "auto"
-        compute = "auto"
-
-    _model = WhisperModel(
-        model_size,
-        device=device,
-        compute_type=compute,
-        download_root=str(get_model_cache_dir()),
-    )
+    # Try GPU first, fall back to CPU if it fails (e.g. no CUDA, driver issues)
+    for device in ("cuda", "cpu"):
+        try:
+            _model = WhisperModel(
+                model_size,
+                device=device,
+                compute_type="auto",
+                download_root=str(get_model_cache_dir()),
+            )
+            break
+        except Exception:
+            if device == "cpu":
+                raise
+            print(f"  ⚠️  GPU init failed, falling back to CPU")
     _model_size = model_size
 
     # Log device info
