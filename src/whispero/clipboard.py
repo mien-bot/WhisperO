@@ -122,9 +122,10 @@ def paste_text(text: str) -> None:
         kb.release("v")
         kb.release(Key.ctrl)
 
-    # Restore original clipboard after paste completes
+    # Restore original clipboard after paste completes.
+    # 0.4s gives target app time to consume the paste, even on slow apps.
     if saved_clipboard is not None:
-        time.sleep(0.15)  # Wait for paste to finish
+        time.sleep(0.4)
         if system == "Windows":
             restore_clipboard_win32(saved_clipboard)
         elif system == "Darwin":

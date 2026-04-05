@@ -341,7 +341,7 @@ def build_installer() -> None:
 
 
 def main() -> None:
-    print(f"🔨 {APP_NAME} Build Script\n")
+    print(f"{APP_NAME} Build Script\n")
     check_deps()
     generate_icons()
     build_pyinstaller()
@@ -349,7 +349,7 @@ def main() -> None:
     if "--installer" in sys.argv:
         build_installer()
 
-    print("\n🎉 Done!")
+    print("\nDone!")
 
 
 if __name__ == "__main__":

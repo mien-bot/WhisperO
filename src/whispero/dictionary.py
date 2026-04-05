@@ -27,7 +27,8 @@ def load_dictionary(seed_path: Path | None = None) -> str:
             if line and not line.startswith("#"):
                 words.append(line)
         return ", ".join(words) if words else ""
-    except Exception:
+    except Exception as e:
+        print(f"  Warning: could not load dictionary ({e})")
         return ""
 
 

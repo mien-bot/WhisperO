@@ -10,17 +10,16 @@ from pathlib import Path
 import requests
 from pynput import keyboard
 
-from .audio import RecorderState, start_recording, stop_recording
+from .audio import RecorderState, get_input_devices, start_recording, stop_recording
 from .clipboard import paste_text
 from .config import SOUND_OPTIONS, load_config, save_config_value
 from .dictionary import load_dictionary, open_dictionary
 from .sounds import play_sound
 from .transcribe import transcribe
 
-signal.signal(signal.SIGINT, lambda *_: (print("\n  😮 Stopping WhisperO..."), os._exit(0)))
-
 config = load_config()
 state = RecorderState()
+_transcription_lock = threading.Lock()  # prevent overlapping transcriptions
 
 
 KEY_MAP = {
@@ -51,27 +50,23 @@ KEY_MAP = {
     "backspace": keyboard.Key.backspace,
 }
 
-# Reverse lookup: pynput key object -> config name
-_REVERSE_KEY_MAP: dict = {}
-# Special keys (keyboard.Key members)
-_SPECIAL_KEY_NAMES = {
-    keyboard.Key.cmd: "win", keyboard.Key.cmd_r: "win",
-    keyboard.Key.ctrl_l: "ctrl", keyboard.Key.ctrl_r: "ctrl",
-    keyboard.Key.shift: "shift", keyboard.Key.shift_r: "shift",
-    keyboard.Key.alt: "alt", keyboard.Key.alt_r: "alt",
-    keyboard.Key.f1: "f1", keyboard.Key.f2: "f2", keyboard.Key.f3: "f3",
-    keyboard.Key.f4: "f4", keyboard.Key.f5: "f5", keyboard.Key.f6: "f6",
-    keyboard.Key.f7: "f7", keyboard.Key.f8: "f8", keyboard.Key.f9: "f9",
-    keyboard.Key.f10: "f10", keyboard.Key.f11: "f11", keyboard.Key.f12: "f12",
-    keyboard.Key.insert: "insert", keyboard.Key.delete: "delete",
-    keyboard.Key.home: "home", keyboard.Key.end: "end",
-    keyboard.Key.page_up: "page_up", keyboard.Key.page_down: "page_down",
-    keyboard.Key.menu: "menu", keyboard.Key.scroll_lock: "scroll_lock",
-    keyboard.Key.pause: "pause", keyboard.Key.caps_lock: "caps_lock",
-    keyboard.Key.num_lock: "num_lock", keyboard.Key.print_screen: "print_screen",
-    keyboard.Key.esc: "esc", keyboard.Key.space: "space",
-    keyboard.Key.tab: "tab", keyboard.Key.enter: "enter",
-    keyboard.Key.backspace: "backspace",
+# Reverse lookup: pynput key object -> normalized config name
+# Built from KEY_MAP so there's a single source of truth.
+_NORMALIZE_ALIASES = {"cmd": "win", "cmd_r": "win", "ctrl_r": "ctrl", "shift_r": "shift", "alt_r": "alt"}
+_SPECIAL_KEY_NAMES: dict = {}
+for _name, _key_obj in KEY_MAP.items():
+    _resolved = _NORMALIZE_ALIASES.get(_name, _name)
+    # First mapping wins (e.g. "win" before "cmd" for keyboard.Key.cmd)
+    if _key_obj not in _SPECIAL_KEY_NAMES:
+        _SPECIAL_KEY_NAMES[_key_obj] = _resolved
+
+
+# Windows OEM virtual key codes → config names
+_VK_OEM = {
+    0xC0: "`", 0xBD: "-", 0xBB: "=",
+    0xDB: "[", 0xDD: "]", 0xDC: "\\",
+    0xBA: ";", 0xDE: "'", 0xBC: ",",
+    0xBE: ".", 0xBF: "/",
 }
 
 
@@ -87,6 +82,8 @@ def _key_to_name(key) -> str | None:
             return chr(vk).lower()
         if 0x41 <= vk <= 0x5A:  # A-Z
             return chr(vk).lower()
+        if vk in _VK_OEM:
+            return _VK_OEM[vk]
     # Fallback to char for keys without a standard vk (rare)
     if hasattr(key, "char") and key.char is not None and key.char.isprintable():
         return key.char.lower()
@@ -143,13 +140,31 @@ class _HotkeyListener:
         self.listener.daemon = True
         self.listener.start()
 
-    def restart(self):
+    def stop(self):
         if self.listener:
             self.listener.stop()
+            self.listener = None
+
+    def restart(self):
+        self.stop()
         self.start()
 
 
 _hotkey_listener = _HotkeyListener()
+
+
+def _signal_exit(*_):
+    print("\n  Stopping WhisperO...")
+    _hotkey_listener.stop()
+    try:
+        from .transcribe import unload_model
+        unload_model()
+    except Exception:
+        pass
+    os._exit(0)
+
+
+signal.signal(signal.SIGINT, _signal_exit)
 
 _KEY_ORDER = {"win": 0, "cmd": 0, "cmd_r": 1, "ctrl": 2, "ctrl_r": 3,
               "shift": 4, "shift_r": 5, "alt": 6, "alt_r": 7}
@@ -164,6 +179,8 @@ _DISPLAY_NAMES = {
     "insert": "Ins", "delete": "Del", "backspace": "Bksp",
     "esc": "Esc", "space": "Space", "tab": "Tab", "enter": "Enter",
     "menu": "Menu", "pause": "Pause", "home": "Home", "end": "End",
+    "`": "`", "-": "-", "=": "=", "[": "[", "]": "]", "\\": "\\",
+    ";": ";", "'": "'", ",": ",", ".": ".", "/": "/",
 }
 _MAC_DISPLAY = {"cmd": "\u2318", "cmd_r": "\u2318", "ctrl": "\u2303", "ctrl_r": "\u2303",
                 "shift": "\u21e7", "shift_r": "\u21e7", "alt": "\u2325", "alt_r": "\u2325", "win": "\u2318"}
@@ -172,7 +189,8 @@ _MAC_DISPLAY = {"cmd": "\u2318", "cmd_r": "\u2318", "ctrl": "\u2303", "ctrl_r": 
 def _hotkey_display() -> str:
     """Return a human-readable string for the current hotkey."""
     is_mac = platform.system() == "Darwin"
-    key_names = config["hotkey"].get("mac" if is_mac else "windows", ["cmd", "ctrl"])
+    hotkey = config.get("hotkey", {})
+    key_names = hotkey.get("mac" if is_mac else "windows", ["cmd", "ctrl"])
     if is_mac:
         return "".join(_MAC_DISPLAY.get(k, k.upper() if len(k) == 1 else k.title()) for k in key_names)
     return "+".join(_DISPLAY_NAMES.get(k, k.upper() if len(k) == 1 else k.title().replace("_", " ")) for k in key_names)
@@ -249,7 +267,7 @@ def _open_hotkey_dialog(tray_icon=None):
         tk.Frame(inner, bg=BORDER, height=1).pack(fill=tk.X, padx=16, pady=(4, 0))
 
         # Current hotkey
-        current = config["hotkey"].get("mac" if is_mac else "windows", ["cmd", "ctrl"])
+        current = config.get("hotkey", {}).get("mac" if is_mac else "windows", ["cmd", "ctrl"])
         current_display = " + ".join(
             _DISPLAY_NAMES.get(n, n.upper() if len(n) == 1 else n.title()) for n in current
         )
@@ -261,8 +279,7 @@ def _open_hotkey_dialog(tray_icon=None):
                         highlightthickness=1, padx=20, pady=14)
         card.pack(padx=24, pady=(4, 6))
 
-        key_var = tk.StringVar(value="Press any key...")
-        key_label = tk.Label(card, textvariable=key_var, font=("Segoe UI", 20, "bold"),
+        key_label = tk.Label(card, text="Press any key...", font=("Segoe UI", 20, "bold"),
                              bg=BG_CARD, fg=TEXT_KEY)
         key_label.pack()
 
@@ -292,7 +309,7 @@ def _open_hotkey_dialog(tray_icon=None):
                 best = names
                 label = "  +  ".join(_display_name(n) for n in names)
                 try:
-                    root.after(0, key_var.set, label)
+                    root.after(0, key_label.configure, {"text": label})
                 except Exception:
                     pass
 
@@ -307,7 +324,6 @@ def _open_hotkey_dialog(tray_icon=None):
 
         def _cleanup_and_close():
             tmp.stop()
-            key_var.set("")
             root.destroy()
             _hotkey_listener.start()
 
@@ -605,21 +621,20 @@ def _play_sound(name: str) -> None:
     play_sound(name=sound_file, sounds_enabled=bool(config.get("sounds", True)), sounds_dir=_sounds_dir())
 
 
-_NORMALIZE_KEYS = {"ctrl_r": "ctrl", "shift_r": "shift", "alt_r": "alt", "cmd_r": "win"}
-
-
 def get_trigger_key_names() -> set:
     """Get trigger key names from config based on platform."""
     is_mac = platform.system() == "Darwin"
-    key_names = config["hotkey"].get("mac" if is_mac else "windows", ["cmd", "ctrl"])
-    return set(_NORMALIZE_KEYS.get(n.lower(), n.lower()) for n in key_names)
+    hotkey = config.get("hotkey", {})
+    key_names = hotkey.get("mac" if is_mac else "windows", ["cmd", "ctrl"])
+    return set(_NORMALIZE_ALIASES.get(n.lower(), n.lower()) for n in key_names)
 
 
 def on_hotkey_press() -> None:
     try:
-        start_recording(state, _play_sound)
+        mic = config.get("mic_device")  # None = system default
+        start_recording(state, _play_sound, device_index=mic)
     except Exception as e:
-        print(f"  ❌ Recording start error: {e}")
+        print(f"  Recording start error: {e}")
 
 
 def on_hotkey_release() -> None:
@@ -632,6 +647,9 @@ def on_hotkey_release() -> None:
         return
 
     def do_transcribe() -> None:
+        if not _transcription_lock.acquire(blocking=False):
+            print("  ⏳ Transcription already in progress, skipping")
+            return
         try:
             prompt = load_dictionary(seed_path=_dictionary_seed_path())
             text = transcribe(audio_buf=audio_buf, config=config, prompt=prompt)
@@ -643,6 +661,8 @@ def on_hotkey_release() -> None:
                 print("  ⚠️  No transcription returned")
         except Exception as e:
             print(f"  ❌ Transcription error: {e}")
+        finally:
+            _transcription_lock.release()
 
     threading.Thread(target=do_transcribe, daemon=True).start()
 
@@ -684,6 +704,12 @@ def create_tray_icon():
         print(f"  🔄 Dictation {status}")
 
     def on_quit(icon, item):
+        _hotkey_listener.stop()
+        try:
+            from .transcribe import unload_model
+            unload_model()
+        except Exception:
+            pass
         icon.stop()
         os._exit(0)
 
@@ -696,16 +722,21 @@ def create_tray_icon():
                 return
             config["model"] = model_name
             save_config_value("model", model_name)
-            print(f"  🔄 Switching to {model_name}...")
-            if config.get("backend", "local") == "local":
-                try:
-                    from .transcribe import get_model, is_model_cached
-                    if not is_model_cached(model_name):
-                        print(f"  ⏳ Downloading {model_name}...")
-                    get_model(model_name)
-                    print(f"  ✓ {model_name} ready")
-                except Exception as e:
-                    print(f"  ❌ Failed to load {model_name}: {e}")
+            print(f"  Switching to {model_name}...")
+
+            def _switch():
+                if config.get("backend", "local") == "local":
+                    try:
+                        from .transcribe import get_model, is_model_cached
+                        if not is_model_cached(model_name):
+                            print(f"  Downloading {model_name}...")
+                        get_model(model_name)
+                        print(f"  {model_name} ready")
+                    except Exception as e:
+                        print(f"  Failed to load {model_name}: {e}")
+                    icon.update_menu()
+
+            threading.Thread(target=_switch, daemon=True).start()
         return callback
 
     def is_current_model(model_name):
@@ -716,6 +747,85 @@ def create_tray_icon():
 
     def on_change_sounds(icon, item):
         _open_sound_dialog()
+
+    DEVICES = ["GPU", "CPU"]
+
+    def make_device_callback(device_name):
+        def callback(icon, item):
+            target = device_name.lower()
+            if config.get("device") == target:
+                return
+            config["device"] = target
+            save_config_value("device", target)
+            print(f"  Switching to {device_name}...")
+
+            def _switch():
+                if config.get("backend", "local") == "local":
+                    try:
+                        from .transcribe import reload_model
+                        reload_model(config.get("model", "large-v3"), target)
+                        print(f"  Model reloaded on {device_name}")
+                    except Exception as e:
+                        print(f"  Failed to switch to {device_name}: {e}")
+                icon.update_menu()
+
+            threading.Thread(target=_switch, daemon=True).start()
+        return callback
+
+    def is_current_device(device_name):
+        return lambda item: config.get("device", "gpu") == device_name.lower()
+
+    # --- Microphone selection ---
+    _input_devices = get_input_devices()
+
+    def make_mic_callback(dev_idx, dev_name):
+        def callback(icon, item):
+            config["mic_device"] = dev_idx
+            save_config_value("mic_device", dev_idx)
+            print(f"  Microphone: {dev_name} (device {dev_idx})")
+            icon.update_menu()
+        return callback
+
+    def on_mic_default(icon, item):
+        config.pop("mic_device", None)
+        save_config_value("mic_device", None)
+        print("  Microphone: System Default")
+        icon.update_menu()
+
+    def is_mic_default():
+        return lambda item: config.get("mic_device") is None
+
+    def is_current_mic(dev_idx):
+        return lambda item: config.get("mic_device") == dev_idx
+
+    mic_menu = pystray.Menu(
+        pystray.MenuItem(
+            "System Default", on_mic_default,
+            checked=is_mic_default(), radio=True
+        ),
+        *[pystray.MenuItem(
+            name, make_mic_callback(idx, name),
+            checked=is_current_mic(idx), radio=True
+        ) for idx, name in _input_devices]
+    )
+
+    # --- Model status ---
+    def _model_status_label(item):
+        try:
+            from .transcribe import _model, _model_lock, _model_size, is_model_cached
+            model_name = config.get("model", "large-v3")
+            with _model_lock:
+                loaded = _model is not None
+                loaded_size = _model_size
+            if loaded:
+                dev = (config.get("device") or "gpu").upper()
+                return f"Model: {loaded_size or model_name} ({dev}) - Loaded"
+            elif is_model_cached(model_name):
+                return f"Model: {model_name} - Cached (not loaded)"
+            else:
+                return f"Model: {model_name} - Not downloaded"
+        except Exception:
+            return "Model: unknown"
 
     model_menu = pystray.Menu(
         *[pystray.MenuItem(
@@ -735,6 +845,8 @@ def create_tray_icon():
             save_config_value("backend", "server")
             save_config_value("server", url)
             print(f"  🔄 Server: {url}")
+            from .transcribe import unload_model
+            unload_model()
             icon.update_menu()
         return callback
 
@@ -746,6 +858,9 @@ def create_tray_icon():
             config["backend"] = backend_name
             save_config_value("backend", backend_name)
             print(f"  🔄 Backend: {backend_name}")
+            if backend_name == "server":
+                from .transcribe import unload_model
+                unload_model()
             icon.update_menu()
         return callback
 
@@ -770,6 +885,15 @@ def create_tray_icon():
             "Select Model", model_menu,
             enabled=lambda item: config.get("backend", "local") == "local"
         ),
+        pystray.MenuItem("Device (GPU/CPU)", pystray.Menu(
+            *[pystray.MenuItem(
+                d, make_device_callback(d), checked=is_current_device(d), radio=True
+            ) for d in DEVICES]
+        ), enabled=lambda item: config.get("backend", "local") == "local"),
+        pystray.MenuItem("Select Microphone", mic_menu),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(_model_status_label, None, enabled=False),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Change Sounds...", on_change_sounds),
         pystray.MenuItem("Edit Dictionary", on_edit_dict),
         pystray.MenuItem("Change Hotkey...", on_change_hotkey),
@@ -805,56 +929,81 @@ def main() -> None:
 
     backend = config.get("backend", "local")
 
+    # Restore persisted last working server
+    saved_server = config.get("last_working_server")
+    if saved_server:
+        from . import transcribe as _transcribe_mod
+        _transcribe_mod._last_working_server = saved_server
+
     if backend == "local":
-        try:
-            from .transcribe import get_model, is_model_cached
-            model_name = config.get("model", "large-v3")
-            print(f"😮 WhisperO (local, model: {model_name})")
-            if not is_model_cached(model_name):
-                print("  ⏳ Downloading model (this may take a few minutes)...")
-            else:
-                print("  ⏳ Loading model...")
-            get_model(model_name)
-            print("  ✓ Model ready")
-        except (ImportError, RuntimeError):
-            print("  ⚠️  faster-whisper not available, falling back to server mode")
-            backend = "server"
-            config["backend"] = "server"
+        model_name = config.get("model", "large-v3")
+        print(f"WhisperO (local, model: {model_name})")
+
+        def _load_model_bg():
+            try:
+                from .transcribe import get_model, is_model_cached
+                if not is_model_cached(model_name):
+                    print("  Downloading model (this may take a few minutes)...")
+                else:
+                    print("  Loading model...")
+                device_pref = config.get("device")  # None = auto (GPU first)
+                get_model(model_name, device_pref=device_pref)
+                print("  Model ready (hotkey active)")
+            except (ImportError, RuntimeError) as e:
+                print(f"  faster-whisper not available ({e}), falling back to server mode")
+                config["backend"] = "server"
+
+        threading.Thread(target=_load_model_bg, daemon=True).start()
     if backend == "server":
-        print(f"🎤 WhisperO (server: {config['server']})")
+        print(f"WhisperO (server: {config['server']})")
         try:
             response = requests.get(f"{config['server']}/health", timeout=5)
             if response.json().get("status") == "ok":
-                print("  ✓ Server is healthy")
+                print("  Server is healthy")
             else:
-                print("  ⚠️  Unexpected server response")
+                print("  Unexpected server response")
         except Exception:
-            print("  ❌ Cannot reach server, will retry on each recording")
+            print("  Cannot reach server, will retry on each recording")
 
-    print(f"🎹 Hotkey: hold [{_hotkey_display()}] to record")
-    print("🔇 Press Ctrl+C to quit\n")
+    print(f"Hotkey: hold [{_hotkey_display()}] to record")
+    print("Press Ctrl+C to quit\n")
 
     _hotkey_listener.start()
 
     tray = create_tray_icon()
     if tray:
+        def _run_tray():
+            try:
+                tray.run()
+            except Exception as e:
+                print(f"  Tray icon crashed: {e}")
+
         if platform.system() == "Windows":
             # Windows: run tray in background thread so Ctrl+C works
-            tray_thread = threading.Thread(target=tray.run, daemon=True)
+            tray_thread = threading.Thread(target=_run_tray, daemon=True)
             tray_thread.start()
             try:
-                tray_thread.join()
+                # Keep alive even if tray crashes — hotkey still works
+                while tray_thread.is_alive():
+                    tray_thread.join(timeout=1)
+                # Tray exited — keep running on hotkey listener alone
+                print("  Tray exited, hotkey still active")
+                if _hotkey_listener.listener:
+                    _hotkey_listener.listener.join()
             except KeyboardInterrupt:
+                _hotkey_listener.stop()
                 tray.stop()
-                print("\n👋 Bye!")
+                print("\nBye!")
         else:
             # macOS/Linux: tray must run on main thread (AppKit requirement)
             tray.run()
     else:
         try:
-            _hotkey_listener.listener.join()
+            if _hotkey_listener.listener:
+                _hotkey_listener.listener.join()
         except KeyboardInterrupt:
-            print("\n👋 Bye!")
+            _hotkey_listener.stop()
+            print("\nBye!")
 
 
 if __name__ == "__main__":

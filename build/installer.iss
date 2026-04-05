@@ -8,7 +8,7 @@
 ;   Output: dist/WhisperO-Setup.exe
 
 #define MyAppName      "WhisperO"
-#define MyAppVersion   "0.1.1"
+#define MyAppVersion   "0.1.0"
 #define MyAppPublisher "Parker Cai"
 #define MyAppExeName   "WhisperO.exe"
 
@@ -55,7 +55,7 @@ Type: filesandordirs; Name: "{app}\*"
 
 [Run]
 ; Download the whisper model after install (shown in a console window so user sees progress)
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--download-model"; StatusMsg: "Downloading speech recognition model (this may take a few minutes)..."; Flags: runhidden waituntilterminated
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--download-model"; StatusMsg: "Downloading speech recognition model (~3 GB, this may take a few minutes)..."; Flags: waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]

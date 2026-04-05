@@ -9,7 +9,10 @@ from typing import Any
 DEFAULTS = {
     "backend": "local",
     "server": "http://localhost:8080",
+    "fallback_servers": [],
     "model": "large-v3",
+    "device": None,           # None = auto (GPU first, then CPU)
+    "mic_device": None,       # None = system default
     "hotkey": {"windows": ["win", "ctrl"], "mac": ["cmd", "ctrl"]},
     "sounds": True,
     "start_sound": "start",
