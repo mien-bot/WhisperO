@@ -138,7 +138,17 @@ def clean_build() -> None:
 
 def write_entry_script() -> None:
     ENTRY_SCRIPT.write_text(
-        "import multiprocessing\nmultiprocessing.freeze_support()\n\nfrom whispero.app import main\n\nif __name__ == '__main__':\n    main()\n",
+        "import multiprocessing\n"
+        "multiprocessing.freeze_support()\n\n"
+        "import sys\n"
+        "if sys.stdout is None:\n"
+        "    from pathlib import Path\n"
+        "    _log = Path.home() / '.whispero' / 'whispero.log'\n"
+        "    _log.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    sys.stdout = sys.stderr = open(_log, 'w', encoding='utf-8')\n\n"
+        "from whispero.app import main\n\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
         encoding="utf-8",
     )
 
@@ -198,7 +208,7 @@ def build_pyinstaller() -> None:
     elif system == "Windows":
         ico = ICONS_DIR / "icon.ico"
         args += [
-            "--console",
+            "--windowed",
             "--hidden-import",
             "pynput.keyboard._win32",
             "--hidden-import",
@@ -302,11 +312,43 @@ def build_pyinstaller() -> None:
         print(f"{'=' * 55}")
 
 
+def build_installer() -> None:
+    """Build a Windows installer using Inno Setup (optional)."""
+    iss = SCRIPT_DIR / "installer.iss"
+    if not iss.exists():
+        print("  ❌ installer.iss not found")
+        sys.exit(1)
+
+    iscc = shutil.which("iscc") or shutil.which("ISCC")
+    if not iscc:
+        # Check default Inno Setup install locations
+        for candidate in [
+            Path(os.environ.get("ProgramFiles(x86)", "")) / "Inno Setup 6" / "ISCC.exe",
+            Path(os.environ.get("ProgramFiles", "")) / "Inno Setup 6" / "ISCC.exe",
+        ]:
+            if candidate.exists():
+                iscc = str(candidate)
+                break
+
+    if not iscc:
+        print("  ❌ Inno Setup not found. Install from https://jrsoftware.org/isinfo.php")
+        print("     Then re-run:  python build/build.py --installer")
+        sys.exit(1)
+
+    print("\n  Building Windows installer...")
+    run([iscc, str(iss)], cwd=str(SCRIPT_DIR))
+    print(f"\n  ✅ Installer: dist/WhisperO-Setup.exe")
+
+
 def main() -> None:
     print(f"🔨 {APP_NAME} Build Script\n")
     check_deps()
     generate_icons()
     build_pyinstaller()
+
+    if "--installer" in sys.argv:
+        build_installer()
+
     print("\n🎉 Done!")
 
 

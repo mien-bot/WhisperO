@@ -36,6 +36,149 @@ KEY_MAP = {
 }
 
 
+class _HotkeyListener:
+    """Manages the global keyboard listener for hotkey detection."""
+
+    def __init__(self):
+        self.listener = None
+        self.trigger_keys: set = set()
+        self._keys_held: set = set()
+        self._recording_active = False
+
+    def start(self):
+        self.trigger_keys = get_trigger_keys()
+        self._keys_held = set()
+        self._recording_active = False
+
+        def on_press(key):
+            self._keys_held.add(key)
+            if self.trigger_keys.issubset(self._keys_held) and not self._recording_active:
+                self._recording_active = True
+                on_hotkey_press()
+
+        def on_release(key):
+            if key in self.trigger_keys and self._recording_active:
+                self._recording_active = False
+                on_hotkey_release()
+            self._keys_held.discard(key)
+
+        self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self.listener.daemon = True
+        self.listener.start()
+
+    def restart(self):
+        if self.listener:
+            self.listener.stop()
+        self.start()
+
+
+_hotkey_listener = _HotkeyListener()
+
+_KEY_ORDER = {"win": 0, "cmd": 0, "cmd_r": 1, "ctrl": 2, "ctrl_r": 3,
+              "shift": 4, "shift_r": 5, "alt": 6, "alt_r": 7}
+
+
+def _hotkey_display() -> str:
+    """Return a human-readable string for the current hotkey."""
+    is_mac = platform.system() == "Darwin"
+    key_names = config["hotkey"].get("mac" if is_mac else "windows", ["cmd", "ctrl"])
+    if is_mac:
+        sym = {"cmd": "⌘", "cmd_r": "⌘", "ctrl": "⌃", "ctrl_r": "⌃",
+               "shift": "⇧", "shift_r": "⇧", "alt": "⌥", "alt_r": "⌥", "win": "⌘"}
+        return "".join(sym.get(k, k.title()) for k in key_names)
+    sym = {"win": "Win", "cmd": "Win", "ctrl": "Ctrl", "ctrl_r": "Ctrl",
+           "shift": "Shift", "shift_r": "Shift", "alt": "Alt", "alt_r": "Alt"}
+    return "+".join(sym.get(k, k.title()) for k in key_names)
+
+
+def _open_hotkey_dialog(tray_icon=None):
+    """Open a tkinter dialog to capture a new hotkey combination."""
+
+    def _run():
+        import tkinter as tk
+
+        is_mac = platform.system() == "Darwin"
+        reverse = {
+            keyboard.Key.cmd: "cmd" if is_mac else "win",
+            keyboard.Key.cmd_r: "cmd_r" if is_mac else "win",
+            keyboard.Key.ctrl_l: "ctrl",
+            keyboard.Key.ctrl_r: "ctrl_r",
+            keyboard.Key.shift: "shift",
+            keyboard.Key.shift_r: "shift_r",
+            keyboard.Key.alt: "alt",
+            keyboard.Key.alt_r: "alt_r",
+        }
+
+        root = tk.Tk()
+        root.title("WhisperO \u2013 Change Hotkey")
+        root.geometry("380x200")
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() - 380) // 2
+        y = (root.winfo_screenheight() - 200) // 2
+        root.geometry(f"+{x}+{y}")
+
+        current = config["hotkey"].get("mac" if is_mac else "windows", ["cmd", "ctrl"])
+        tk.Label(root, text=f"Current: {' + '.join(n.title() for n in current)}",
+                 font=("Segoe UI", 10), fg="#666666").pack(pady=(15, 2))
+        tk.Label(root, text="Hold 2+ modifier keys to set new hotkey",
+                 font=("Segoe UI", 10)).pack(pady=(2, 8))
+
+        key_var = tk.StringVar(value="Waiting...")
+        tk.Label(root, textvariable=key_var, font=("Segoe UI", 16, "bold"),
+                 fg="#0066cc").pack(pady=8)
+
+        btn_frame = tk.Frame(root)
+        btn_frame.pack(pady=12)
+
+        held: set = set()
+        best: list = []
+
+        def on_press(key):
+            nonlocal best
+            if key in reverse:
+                held.add(key)
+                names = sorted([reverse[k] for k in held if k in reverse],
+                               key=lambda n: _KEY_ORDER.get(n, 99))
+                if len(names) >= 2:
+                    best = names
+                    try:
+                        key_var.set(" + ".join(n.title() for n in names))
+                    except Exception:
+                        pass
+
+        def on_release(key):
+            held.discard(key)
+
+        tmp = keyboard.Listener(on_press=on_press, on_release=on_release)
+        tmp.daemon = True
+        tmp.start()
+
+        def save():
+            if best:
+                plat = "mac" if is_mac else "windows"
+                config["hotkey"][plat] = best
+                save_config_value("hotkey", config["hotkey"])
+                _hotkey_listener.restart()
+                print(f"  🎹 Hotkey changed to: {' + '.join(n.title() for n in best)}")
+                if tray_icon:
+                    tray_icon.update_menu()
+            tmp.stop()
+            root.destroy()
+
+        def cancel():
+            tmp.stop()
+            root.destroy()
+
+        tk.Button(btn_frame, text="Save", command=save, width=10).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Cancel", command=cancel, width=10).pack(side=tk.LEFT, padx=5)
+        root.protocol("WM_DELETE_WINDOW", cancel)
+        root.mainloop()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _bundle_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys._MEIPASS)
@@ -164,10 +307,8 @@ def create_tray_icon():
     def is_current_model(model_name):
         return lambda item: config.get("model", "large-v3") == model_name
 
-    if platform.system() == "Darwin":
-        hotkey_label = "Hold ⌃⌘ to dictate"
-    else:
-        hotkey_label = "Hold Win+Ctrl to dictate"
+    def on_change_hotkey(icon, item):
+        _open_hotkey_dialog(icon)
 
     model_menu = pystray.Menu(
         *[pystray.MenuItem(
@@ -205,7 +346,7 @@ def create_tray_icon():
         return lambda item: config.get("backend", "local") == backend_name
 
     menu = pystray.Menu(
-        pystray.MenuItem(hotkey_label, None, enabled=False),
+        pystray.MenuItem(lambda item: f"Hold {_hotkey_display()} to dictate", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda item: "✓ Enabled" if state.enabled else "  Disabled", on_toggle),
         pystray.MenuItem("Select Backend", pystray.Menu(
@@ -223,6 +364,7 @@ def create_tray_icon():
             enabled=lambda item: config.get("backend", "local") == "local"
         ),
         pystray.MenuItem("Edit Dictionary", on_edit_dict),
+        pystray.MenuItem("Change Hotkey...", on_change_hotkey),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", on_quit),
     )
@@ -260,36 +402,10 @@ def main() -> None:
         except Exception:
             print("  ❌ Cannot reach server, will retry on each recording")
 
-    trigger_keys = get_trigger_keys()
-    keys_held = set()
-    recording_active = False
-
-    is_mac = platform.system() == "Darwin"
-    if is_mac:
-        key_names = config["hotkey"].get("mac", ["cmd", "ctrl"])
-        print(f"🎹 Hotkey: hold [{' + '.join(k.title() for k in key_names)}] to record")
-    else:
-        key_names = config["hotkey"].get("windows", ["win", "ctrl"])
-        print(f"🎹 Hotkey: hold [{' + '.join(k.title() for k in key_names)}] to record")
+    print(f"🎹 Hotkey: hold [{_hotkey_display()}] to record")
     print("🔇 Press Ctrl+C to quit\n")
 
-    def on_press(key):
-        nonlocal recording_active
-        keys_held.add(key)
-        if trigger_keys.issubset(keys_held) and not recording_active:
-            recording_active = True
-            on_hotkey_press()
-
-    def on_release(key):
-        nonlocal recording_active
-        if key in trigger_keys and recording_active:
-            recording_active = False
-            on_hotkey_release()
-        keys_held.discard(key)
-
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.daemon = True
-    listener.start()
+    _hotkey_listener.start()
 
     tray = create_tray_icon()
     if tray:
@@ -307,7 +423,7 @@ def main() -> None:
             tray.run()
     else:
         try:
-            listener.join()
+            _hotkey_listener.listener.join()
         except KeyboardInterrupt:
             print("\n👋 Bye!")
 
