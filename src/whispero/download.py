@@ -11,46 +11,72 @@ import requests
 
 from .diarize import MODEL_DIR, ONNX_PATH, STATS_PATH, is_model_downloaded
 
-# ── Update these after running scripts/export_ecapa_onnx.py ─────────────
-# Host the exported files on GitHub Releases and paste the URLs + hashes here.
-ONNX_URL = "https://github.com/parkercai/whispero/releases/download/models-v1/ecapa_tdnn_voxceleb.onnx"
-STATS_URL = "https://github.com/parkercai/whispero/releases/download/models-v1/ecapa_stats.npz"
-ONNX_SHA256 = ""   # fill after export
-STATS_SHA256 = ""  # fill after export
-ONNX_SIZE_BYTES = 85_000_000  # approximate, updated after export
+# ── Model file URLs and checksums ────────────────────────────────────────
+_BASE_URL = "https://github.com/mien-bot/WhisperO/releases/download/models-v1"
+ONNX_URL = f"{_BASE_URL}/ecapa_tdnn_voxceleb.onnx"
+ONNX_DATA_URL = f"{_BASE_URL}/ecapa_tdnn_voxceleb.onnx.data"
+STATS_URL = f"{_BASE_URL}/ecapa_stats.npz"
+
+ONNX_SHA256 = "3783724564edbe7818ffe9f0bde7e6f59fc3197630957f081b5f9f68f7887c7c"
+ONNX_DATA_SHA256 = "069be348f6c01a15dbd1c6ea4d77a141c444a0ed0ae895af4d2e61123cb9e27d"
+STATS_SHA256 = "df08b272fad05be5512712c584aea8e23f5d4fbe1c325408e3c402abfd89d596"
+
+# Total download: .onnx (~0.6 MB) + .onnx.data (~79 MB) + stats (~0.5 KB)
+TOTAL_DOWNLOAD_BYTES = 586_914 + 83_230_720 + 500  # ~80 MB
 
 
 ProgressCallback = Callable[[int, int], None]  # (downloaded, total)
 
 
 def get_model_size() -> int:
-    """Return expected download size in bytes."""
-    return ONNX_SIZE_BYTES
+    """Return expected total download size in bytes."""
+    return TOTAL_DOWNLOAD_BYTES
 
 
 def download_diarization_model(
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
-    """Download the ONNX diarization model and stats file.
+    """Download the ONNX diarization model files.
 
-    Streams with resume support (.part files). Verifies SHA256 if configured.
-    Returns the path to the downloaded ONNX model.
+    Downloads three files: .onnx (graph), .onnx.data (weights), .npz (stats).
+    Streams with resume support. Verifies SHA256 checksums.
+    Returns the path to the ONNX model file.
     """
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Track cumulative progress across all files
+    cumulative = [0]
+    total = TOTAL_DOWNLOAD_BYTES
+
+    def _wrap_progress(downloaded: int, _file_total: int) -> None:
+        if progress_callback:
+            progress_callback(cumulative[0] + downloaded, total)
+
+    # 1. Download .onnx graph file (~0.6 MB)
     _download_file(
         url=ONNX_URL,
         dest=ONNX_PATH,
-        expected_sha256=ONNX_SHA256 or None,
-        progress_callback=progress_callback,
+        expected_sha256=ONNX_SHA256,
+        progress_callback=_wrap_progress,
     )
+    cumulative[0] += ONNX_PATH.stat().st_size
 
-    # Stats file is small, download without progress
+    # 2. Download .onnx.data weights file (~79 MB — the big one)
+    data_path = ONNX_PATH.with_suffix(".onnx.data")
+    _download_file(
+        url=ONNX_DATA_URL,
+        dest=data_path,
+        expected_sha256=ONNX_DATA_SHA256,
+        progress_callback=_wrap_progress,
+    )
+    cumulative[0] += data_path.stat().st_size
+
+    # 3. Stats file is small, download without progress
     try:
         _download_file(
             url=STATS_URL,
             dest=STATS_PATH,
-            expected_sha256=STATS_SHA256 or None,
+            expected_sha256=STATS_SHA256,
         )
     except Exception as e:
         # Stats are optional — per-utterance norm works as fallback
@@ -61,7 +87,7 @@ def download_diarization_model(
 
 def remove_diarization_model() -> None:
     """Remove downloaded model files."""
-    for path in [ONNX_PATH, STATS_PATH]:
+    for path in [ONNX_PATH, ONNX_PATH.with_suffix(".onnx.data"), STATS_PATH]:
         if path.exists():
             path.unlink()
     # Remove .part files too

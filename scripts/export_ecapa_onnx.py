@@ -14,10 +14,15 @@ After export, speechbrain/torch can be uninstalled.
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+# Avoid symlink issues on Windows
+os.environ["SB_FETCH_STRATEGY"] = "copy"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "models"
 
@@ -35,11 +40,14 @@ def main() -> None:
 
     # ── Load the pretrained model ────────────────────────────────────────
     print("Loading speechbrain ECAPA-TDNN model...")
+    from speechbrain.utils.fetching import LocalStrategy
+
     save_dir = Path.home() / ".whispero" / "models" / "spkrec-ecapa-voxceleb"
     classifier = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",
         savedir=str(save_dir),
         run_opts={"device": "cpu"},
+        local_strategy=LocalStrategy.COPY,
     )
 
     # ── Extract the embedding model ──────────────────────────────────────
@@ -80,6 +88,15 @@ def main() -> None:
 
     # ── Export to ONNX ───────────────────────────────────────────────────
     print("Exporting to ONNX...")
+
+    # Remove speechbrain lazy modules from sys.modules to prevent conflict
+    # with torch.onnx's use of inspect (speechbrain lazy imports intercept
+    # hasattr checks and can trigger ImportError for optional deps like k2).
+    import sys as _sys
+    sb_keys = [k for k in _sys.modules if k.startswith("speechbrain")]
+    for k in sb_keys:
+        del _sys.modules[k]
+
     # Create dummy input: (batch=1, time_frames=100, mel_bins=80)
     dummy_features = torch.randn(1, 100, 80)
 

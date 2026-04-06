@@ -21,7 +21,7 @@ class DiarizationModelNotFound(Exception):
 
 
 def is_model_downloaded() -> bool:
-    return ONNX_PATH.exists()
+    return ONNX_PATH.exists() and ONNX_PATH.with_suffix(".onnx.data").exists()
 
 
 # ── Numpy Mel filterbank ─────────────────────────────────────────────────
@@ -108,13 +108,17 @@ def _compute_fbank(audio: np.ndarray) -> np.ndarray:
 def _normalize_features(features: np.ndarray, stats_path: Path | None = None) -> np.ndarray:
     """Per-utterance mean normalization (matches SpeechBrain sentence-level norm)."""
     if stats_path and stats_path.exists():
-        stats = np.load(stats_path)
-        mean = stats["mean"].astype(np.float32)
-        std = stats["std"].astype(np.float32)
-        std = np.maximum(std, 1e-10)
-        return (features - mean) / std
+        try:
+            stats = np.load(stats_path)
+            mean = stats["mean"].astype(np.float32)
+            std = stats["std"].astype(np.float32)
+            if mean.size > 0 and std.size > 0:
+                std = np.maximum(std, 1e-10)
+                return (features - mean) / std
+        except Exception:
+            pass
 
-    # Fallback: sentence-level mean subtraction
+    # Sentence-level mean subtraction (default for ECAPA-TDNN)
     mean = features.mean(axis=0, keepdims=True)
     return features - mean
 
