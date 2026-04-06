@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import gc
 import io
-import os
 import sys
-import tempfile
 import threading
 from pathlib import Path
 from typing import Any
@@ -14,6 +12,7 @@ import requests
 _model = None
 _model_size: str | None = None
 _model_lock = threading.RLock()  # protects _model and _model_size across threads
+transcription_lock = threading.Lock()  # shared between push-to-talk and meeting mode
 _last_working_server: str | None = None
 
 
@@ -169,33 +168,115 @@ def transcribe_server(audio_buf: io.BytesIO, server: str, prompt: str = "") -> s
         return None
 
 
-def transcribe_local(audio_buf: io.BytesIO, model_size: str = "large-v3", prompt: str = "") -> str | None:
+def transcribe_local(
+    audio_buf: io.BytesIO,
+    model_size: str = "large-v3",
+    prompt: str = "",
+    languages: list[str] | None = None,
+) -> str | None:
     """Transcribe audio using local faster-whisper model."""
+    if languages is None:
+        languages = ["en"]
     try:
         model = get_model(model_size)
         audio_buf.seek(0)
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp.write(audio_buf.read())
-            tmp_path = tmp.name
+        kwargs: dict = {
+            "initial_prompt": prompt,
+            "beam_size": 1,
+            "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 500},
+            "condition_on_previous_text": False,
+            "without_timestamps": True,
+        }
 
-        try:
-            segments, _info = model.transcribe(
-                tmp_path,
-                initial_prompt=prompt,
-                beam_size=1,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
-            )
-            return " ".join(seg.text for seg in segments).strip()
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
+        # Map custom codes to Whisper codes and build prompt hints
+        _WHISPER_CODE = {"zh-Hant": "zh"}  # Traditional Chinese → zh
+        _SCRIPT_HINTS = {"zh-Hant": "以下是繁體中文的語音轉錄。"}  # bias toward Traditional
+
+        real_langs = [c for c in languages if c != "auto"]
+        has_auto = "auto" in languages
+        whisper_langs = list(dict.fromkeys(_WHISPER_CODE.get(c, c) for c in real_langs))
+
+        # Prepend script hints (e.g. Traditional Chinese) to the prompt
+        script_hint = " ".join(_SCRIPT_HINTS[c] for c in real_langs if c in _SCRIPT_HINTS)
+        if script_hint:
+            prompt = f"{script_hint} {prompt}".strip()
+            kwargs["initial_prompt"] = prompt
+
+        if len(whisper_langs) == 1 and not has_auto:
+            # Single language — skip detection pass (fastest)
+            kwargs["language"] = whisper_langs[0]
+        elif whisper_langs and not has_auto:
+            # Multiple specific languages — auto-detect, hint via prompt
+            from .config import LANG_LABELS
+            lang_names = [LANG_LABELS.get(c, c) for c in real_langs]
+            hint = f"This audio may contain: {', '.join(lang_names)}."
+            kwargs["initial_prompt"] = f"{hint} {prompt}".strip()
+        # else: full auto-detect, no language hint
+
+        segments, _info = model.transcribe(audio_buf, **kwargs)
+        return " ".join(seg.text for seg in segments).strip()
     except Exception as err:
         print(f"  Local transcription error: {err}", file=sys.stderr)
         return None
+
+
+def transcribe_meeting_segment(
+    audio_buf: io.BytesIO,
+    model_size: str = "large-v3",
+    prompt: str = "",
+    languages: list[str] | None = None,
+    word_timestamps: bool = False,
+) -> list[tuple[float, float, str]]:
+    """Transcribe audio segment, returning list of (start_sec, end_sec, text) tuples."""
+    if languages is None:
+        languages = ["en"]
+    try:
+        model = get_model(model_size)
+        audio_buf.seek(0)
+
+        kwargs: dict = {
+            "initial_prompt": prompt,
+            "beam_size": 1,
+            "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 500},
+            "condition_on_previous_text": False,
+            "without_timestamps": False,
+            "word_timestamps": word_timestamps,
+        }
+
+        _WHISPER_CODE = {"zh-Hant": "zh"}
+        _SCRIPT_HINTS = {"zh-Hant": "以下是繁體中文的語音轉錄。"}
+
+        real_langs = [c for c in languages if c != "auto"]
+        has_auto = "auto" in languages
+        whisper_langs = list(dict.fromkeys(_WHISPER_CODE.get(c, c) for c in real_langs))
+
+        script_hint = " ".join(_SCRIPT_HINTS[c] for c in real_langs if c in _SCRIPT_HINTS)
+        if script_hint:
+            prompt = f"{script_hint} {prompt}".strip()
+            kwargs["initial_prompt"] = prompt
+
+        if len(whisper_langs) == 1 and not has_auto:
+            kwargs["language"] = whisper_langs[0]
+        elif whisper_langs and not has_auto:
+            from .config import LANG_LABELS
+            lang_names = [LANG_LABELS.get(c, c) for c in real_langs]
+            hint = f"This audio may contain: {', '.join(lang_names)}."
+            kwargs["initial_prompt"] = f"{hint} {prompt}".strip()
+
+        segments, _info = model.transcribe(audio_buf, **kwargs)
+
+        result = []
+        for seg in segments:
+            text = seg.text.strip()
+            if text:
+                result.append((seg.start, seg.end, text))
+        return result
+    except Exception as err:
+        print(f"  Meeting segment transcription error: {err}", file=sys.stderr)
+        return []
 
 
 def transcribe(
@@ -210,6 +291,7 @@ def transcribe(
     global _last_working_server
     cfg = config or {}
     backend_name = (backend or cfg.get("backend") or ("server" if server else "local")).lower()
+    languages = cfg.get("languages", ["en"])
 
     if backend_name == "server":
         server_url = server or cfg.get("server", "http://localhost:8080")
@@ -240,7 +322,7 @@ def transcribe(
         print("  All servers unavailable, falling back to local...")
         audio_buf.seek(0)
         resolved_model = model_size or cfg.get("model", "large-v3")
-        return transcribe_local(audio_buf=audio_buf, model_size=resolved_model, prompt=prompt)
+        return transcribe_local(audio_buf=audio_buf, model_size=resolved_model, prompt=prompt, languages=languages)
 
     resolved_model = model_size or cfg.get("model", "large-v3")
-    return transcribe_local(audio_buf=audio_buf, model_size=resolved_model, prompt=prompt)
+    return transcribe_local(audio_buf=audio_buf, model_size=resolved_model, prompt=prompt, languages=languages)

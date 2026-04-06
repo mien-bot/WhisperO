@@ -11,12 +11,20 @@ DEFAULTS = {
     "server": "http://localhost:8080",
     "fallback_servers": [],
     "model": "large-v3",
-    "device": None,           # None = auto (GPU first, then CPU)
+    "device": "gpu",          # GPU by default
+    "languages": ["en"],      # checked languages; 1 = fixed, 2+ = auto-detect with hint
     "mic_device": None,       # None = system default
     "hotkey": {"windows": ["win", "ctrl"], "mac": ["cmd", "ctrl"]},
     "sounds": True,
     "start_sound": "start",
     "stop_sound": "stop",
+    "meeting_segment_duration": 10,    # seconds per segment
+    "meeting_overlap": 0.5,            # overlap between segments (avoid cut words)
+    "meeting_auto_open": True,         # open transcript when meeting stops
+    "meeting_diarization": False,      # speaker identification (requires speechbrain)
+    "meeting_diarization_threshold": 0.75,  # speaker matching sensitivity
+    "meeting_max_speakers": 10,
+    "meeting_speaker_names": {},        # e.g. {"1": "Ian", "2": "Parker"}
 }
 
 SOUND_OPTIONS = [
@@ -32,8 +40,23 @@ SOUND_OPTIONS = [
 VALID_BACKENDS = {"local", "server"}
 VALID_MODELS = {"large-v3", "medium", "small", "base", "tiny"}
 
+# (code, display label) — ordered for the tray menu
+# Check one language for fastest speed; check multiple to auto-detect between them
+# "auto" catches anything not in the preset list
+LANGUAGES = [
+    ("en", "English"),
+    ("zh", "Chinese Simplified (简体)"),
+    ("zh-Hant", "Chinese Traditional (繁體)"),
+    ("ja", "Japanese (日本語)"),
+    ("ko", "Korean (한국어)"),
+    ("de", "German (Deutsch)"),
+    ("auto", "Auto-Detect (Other)"),
+]
+LANG_LABELS = dict(LANGUAGES)
+
 CONFIG_DIR = Path.home() / ".whispero"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+MEETINGS_DIR = CONFIG_DIR / "meetings"
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

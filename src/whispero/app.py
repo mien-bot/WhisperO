@@ -12,14 +12,20 @@ from pynput import keyboard
 
 from .audio import RecorderState, get_input_devices, start_recording, stop_recording
 from .clipboard import paste_text
-from .config import SOUND_OPTIONS, load_config, save_config_value
+from .config import (
+    LANG_LABELS, LANGUAGES, MEETINGS_DIR, SOUND_OPTIONS,
+    load_config, save_config_value,
+)
+from .diarize import is_model_downloaded
 from .dictionary import load_dictionary, open_dictionary
+from .download import download_diarization_model, get_model_size, remove_diarization_model
+from .meeting import MeetingSession
 from .sounds import play_sound
-from .transcribe import transcribe
+from .transcribe import transcribe, transcription_lock
 
 config = load_config()
 state = RecorderState()
-_transcription_lock = threading.Lock()  # prevent overlapping transcriptions
+_meeting_session: MeetingSession | None = None
 
 
 KEY_MAP = {
@@ -155,6 +161,10 @@ _hotkey_listener = _HotkeyListener()
 
 def _signal_exit(*_):
     print("\n  Stopping WhisperO...")
+    global _meeting_session
+    if _meeting_session and _meeting_session.running:
+        _meeting_session.stop()
+        _meeting_session = None
     _hotkey_listener.stop()
     try:
         from .transcribe import unload_model
@@ -583,6 +593,262 @@ def _open_sound_dialog():
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _open_rename_speakers_dialog():
+    """Open a dialog to rename Speaker 1, Speaker 2, etc."""
+
+    def _run():
+        import tkinter as tk
+
+        BG = "#1a1a2e"
+        BG_CARD = "#16213e"
+        ACCENT = "#e94560"
+        ACCENT_HOVER = "#ff6b81"
+        TEXT = "#eaeaea"
+        TEXT_DIM = "#8892a0"
+        TEXT_KEY = "#00d2ff"
+        BTN_SAVE_BG = "#e94560"
+        BTN_SAVE_FG = "#ffffff"
+        BTN_CANCEL_BG = "#2a2a4a"
+        BTN_CANCEL_FG = "#aaaaaa"
+        BORDER = "#2a2a4a"
+
+        # Determine which speakers to show (from config or up to 5 slots)
+        current_names = dict(config.get("meeting_speaker_names", {}))
+        max_rows = max(5, len(current_names))
+
+        W, H = 400, 60 + max_rows * 40 + 80
+        root = tk.Tk()
+        root.title("WhisperO")
+        root.geometry(f"{W}x{H}")
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+        root.configure(bg=BG)
+        root.overrideredirect(True)
+        root.update_idletasks()
+        x = (root.winfo_screenwidth() - W) // 2
+        y = (root.winfo_screenheight() - H) // 2
+        root.geometry(f"+{x}+{y}")
+
+        _drag = {"x": 0, "y": 0}
+
+        def _start_drag(e):
+            _drag["x"], _drag["y"] = e.x, e.y
+
+        def _do_drag(e):
+            root.geometry(f"+{root.winfo_x() + e.x - _drag['x']}+"
+                          f"{root.winfo_y() + e.y - _drag['y']}")
+
+        outer = tk.Frame(root, bg=BORDER, padx=1, pady=1)
+        outer.pack(fill=tk.BOTH, expand=True)
+        inner = tk.Frame(outer, bg=BG)
+        inner.pack(fill=tk.BOTH, expand=True)
+
+        title_bar = tk.Frame(inner, bg=BG, height=36)
+        title_bar.pack(fill=tk.X, padx=16, pady=(12, 0))
+        title_bar.pack_propagate(False)
+        title_lbl = tk.Label(title_bar, text="Rename Speakers",
+                             font=("Segoe UI Semibold", 13), bg=BG, fg=TEXT)
+        title_lbl.pack(side=tk.LEFT)
+        close_btn = tk.Label(title_bar, text="\u2715", font=("Segoe UI", 12),
+                             bg=BG, fg=TEXT_DIM, cursor="hand2")
+        close_btn.pack(side=tk.RIGHT)
+        for w in (title_bar, title_lbl):
+            w.bind("<Button-1>", _start_drag)
+            w.bind("<B1-Motion>", _do_drag)
+
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill=tk.X, padx=16, pady=(4, 0))
+
+        tk.Label(inner, text="Type a name for each speaker (leave blank to skip)",
+                 font=("Segoe UI", 9), bg=BG, fg=TEXT_DIM).pack(pady=(10, 6))
+
+        # Speaker name entries
+        entries: dict[str, tk.Entry] = {}
+        for i in range(1, max_rows + 1):
+            key = str(i)
+            row = tk.Frame(inner, bg=BG)
+            row.pack(fill=tk.X, padx=24, pady=2)
+            tk.Label(row, text=f"Speaker {i}:", font=("Segoe UI", 10),
+                     bg=BG, fg=TEXT_KEY, width=10, anchor="e").pack(side=tk.LEFT)
+            ent = tk.Entry(row, font=("Segoe UI", 10), bg=BG_CARD, fg=TEXT,
+                           insertbackground=TEXT, relief=tk.FLAT,
+                           highlightbackground=BORDER, highlightthickness=1)
+            ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+            if key in current_names:
+                ent.insert(0, current_names[key])
+            entries[key] = ent
+
+        # Also rename in last meeting's transcript
+        apply_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(inner, text="Also rename in last meeting transcript",
+                       variable=apply_var, font=("Segoe UI", 9),
+                       bg=BG, fg=TEXT_DIM, selectcolor=BG_CARD,
+                       activebackground=BG, activeforeground=TEXT
+                       ).pack(pady=(8, 4))
+
+        btn_frame = tk.Frame(inner, bg=BG)
+        btn_frame.pack(pady=(4, 16))
+
+        def save():
+            names = {}
+            for key, ent in entries.items():
+                name = ent.get().strip()
+                if name:
+                    names[key] = name
+            config["meeting_speaker_names"] = names
+            save_config_value("meeting_speaker_names", names)
+            print(f"  Speaker names: {names}")
+
+            # Apply to last transcript
+            if apply_var.get() and names:
+                from .config import MEETINGS_DIR
+                try:
+                    txts = sorted(MEETINGS_DIR.glob("Meeting_*.txt"), reverse=True)
+                    if txts:
+                        txt = txts[0]
+                        jsonl = txt.with_suffix(".jsonl")
+                        rename_map = {f"Speaker {k}": v for k, v in names.items()}
+                        MeetingSession.rename_speakers_in_files(txt, jsonl, rename_map)
+                        print(f"  Renamed speakers in {txt.name}")
+                except Exception as e:
+                    print(f"  Rename failed: {e}")
+            root.destroy()
+
+        def cancel():
+            root.destroy()
+
+        def _make_btn(parent, text, command, bg, fg, hover_bg):
+            btn = tk.Label(parent, text=text, font=("Segoe UI Semibold", 10),
+                           bg=bg, fg=fg, padx=24, pady=6, cursor="hand2")
+            btn.bind("<Button-1>", lambda e: command())
+            btn.bind("<Enter>", lambda e: btn.configure(bg=hover_bg))
+            btn.bind("<Leave>", lambda e: btn.configure(bg=bg))
+            return btn
+
+        save_btn = _make_btn(btn_frame, "Save", save, BTN_SAVE_BG, BTN_SAVE_FG, ACCENT_HOVER)
+        save_btn.pack(side=tk.LEFT, padx=8)
+        cancel_btn = _make_btn(btn_frame, "Cancel", cancel, BTN_CANCEL_BG, BTN_CANCEL_FG, "#3a3a5a")
+        cancel_btn.pack(side=tk.LEFT, padx=8)
+
+        close_btn.bind("<Button-1>", lambda e: cancel())
+        close_btn.bind("<Enter>", lambda e: close_btn.configure(fg=ACCENT))
+        close_btn.bind("<Leave>", lambda e: close_btn.configure(fg=TEXT_DIM))
+        root.protocol("WM_DELETE_WINDOW", cancel)
+        root.mainloop()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _open_diarization_download_dialog(tray_icon=None):
+    """Show a dialog to download the speaker diarization model (~80 MB)."""
+
+    def _run():
+        import tkinter as tk
+        from tkinter import ttk
+
+        BG = "#1a1a2e"
+        ACCENT = "#e94560"
+        TEXT = "#eaeaea"
+        TEXT_DIM = "#8892a0"
+
+        root = tk.Tk()
+        root.title("Speaker Identification")
+        root.configure(bg=BG)
+        root.resizable(False, False)
+
+        w, h = 420, 200
+        x = (root.winfo_screenwidth() - w) // 2
+        y = (root.winfo_screenheight() - h) // 2
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.attributes("-topmost", True)
+
+        size_mb = get_model_size() / 1024 / 1024
+
+        info = tk.Label(
+            root, text=f"Speaker identification requires a one-time\n"
+                       f"download (~{size_mb:.0f} MB). Download now?",
+            font=("Segoe UI", 11), bg=BG, fg=TEXT, justify=tk.CENTER,
+        )
+        info.pack(pady=(20, 10))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress_bar = ttk.Progressbar(root, variable=progress_var, maximum=100, length=350)
+
+        status_label = tk.Label(root, text="", font=("Segoe UI", 9), bg=BG, fg=TEXT_DIM)
+
+        _cancel_flag = [False]
+        _downloading = [False]
+
+        def on_download():
+            info.pack_forget()
+            btn_frame.pack_forget()
+            progress_bar.pack(pady=(20, 5))
+            status_label.pack()
+            _downloading[0] = True
+
+            def _do_download():
+                try:
+                    def progress(downloaded, total):
+                        if _cancel_flag[0]:
+                            raise InterruptedError("Cancelled")
+                        if total > 0:
+                            pct = downloaded / total * 100
+                            dl_mb = downloaded / 1024 / 1024
+                            tot_mb = total / 1024 / 1024
+                            root.after(0, lambda: progress_var.set(pct))
+                            root.after(0, lambda: status_label.configure(
+                                text=f"{dl_mb:.1f} / {tot_mb:.1f} MB"
+                            ))
+
+                    download_diarization_model(progress_callback=progress)
+
+                    # Enable diarization
+                    config["meeting_diarization"] = True
+                    save_config_value("meeting_diarization", True)
+                    print("  Speaker diarization model downloaded")
+                    if tray_icon:
+                        tray_icon.update_menu()
+                    root.after(0, root.destroy)
+                except InterruptedError:
+                    remove_diarization_model()
+                    root.after(0, root.destroy)
+                except Exception as e:
+                    print(f"  Download error: {e}")
+                    root.after(0, lambda: status_label.configure(
+                        text=f"Download failed: {e}", fg="#ff6b6b",
+                    ))
+                    root.after(0, lambda: progress_bar.configure(style="red.Horizontal.TProgressbar"))
+
+            threading.Thread(target=_do_download, daemon=True).start()
+
+        def on_cancel():
+            if _downloading[0]:
+                _cancel_flag[0] = True
+            else:
+                root.destroy()
+
+        btn_frame = tk.Frame(root, bg=BG)
+        btn_frame.pack(pady=(5, 15))
+
+        dl_btn = tk.Label(
+            btn_frame, text="Download", font=("Segoe UI Semibold", 10),
+            bg=ACCENT, fg="#fff", padx=24, pady=6, cursor="hand2",
+        )
+        dl_btn.bind("<Button-1>", lambda e: on_download())
+        dl_btn.pack(side=tk.LEFT, padx=8)
+
+        cancel_btn = tk.Label(
+            btn_frame, text="Cancel", font=("Segoe UI Semibold", 10),
+            bg="#2a2a4a", fg=TEXT_DIM, padx=24, pady=6, cursor="hand2",
+        )
+        cancel_btn.bind("<Button-1>", lambda e: on_cancel())
+        cancel_btn.pack(side=tk.LEFT, padx=8)
+
+        root.protocol("WM_DELETE_WINDOW", on_cancel)
+        root.mainloop()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def _bundle_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys._MEIPASS)
@@ -647,8 +913,9 @@ def on_hotkey_release() -> None:
         return
 
     def do_transcribe() -> None:
-        if not _transcription_lock.acquire(blocking=False):
-            print("  ⏳ Transcription already in progress, skipping")
+        # Blocking acquire — push-to-talk has priority over meeting transcription
+        if not transcription_lock.acquire(timeout=10):
+            print("  ⏳ Transcription lock busy, skipping")
             return
         try:
             prompt = load_dictionary(seed_path=_dictionary_seed_path())
@@ -662,7 +929,7 @@ def on_hotkey_release() -> None:
         except Exception as e:
             print(f"  ❌ Transcription error: {e}")
         finally:
-            _transcription_lock.release()
+            transcription_lock.release()
 
     threading.Thread(target=do_transcribe, daemon=True).start()
 
@@ -676,7 +943,7 @@ def create_tray_icon():
         print("  ⚠️  pystray/Pillow not installed, running without tray icon")
         return None
 
-    def make_icon():
+    def make_icon(meeting: bool = False):
         # Try to load the 😮 icon from bundled or project icons
         icon_paths = [
             _bundle_dir() / "icons" / "icon_128.png",
@@ -684,16 +951,23 @@ def create_tray_icon():
             Path(__file__).resolve().parents[2] / "icons" / "icon_128.png",
             Path(__file__).resolve().parents[2] / "icons" / "icon.png",
         ]
+        img = None
         for p in icon_paths:
             if p.exists():
-                return Image.open(p).resize((64, 64), Image.LANCZOS)
-        # Fallback: 😮 face (yellow circle, two eyes, open mouth)
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.ellipse([4, 4, 60, 60], fill="#FFD93D", outline="#2D2D2D", width=3)
-        draw.ellipse([20, 22, 28, 30], fill="#2D2D2D")  # left eye
-        draw.ellipse([36, 22, 44, 30], fill="#2D2D2D")  # right eye
-        draw.ellipse([26, 38, 38, 50], fill="#2D2D2D")  # open mouth
+                img = Image.open(p).resize((64, 64), Image.LANCZOS)
+                break
+        if img is None:
+            # Fallback: 😮 face (yellow circle, two eyes, open mouth)
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+            draw.ellipse([4, 4, 60, 60], fill="#FFD93D", outline="#2D2D2D", width=3)
+            draw.ellipse([20, 22, 28, 30], fill="#2D2D2D")  # left eye
+            draw.ellipse([36, 22, 44, 30], fill="#2D2D2D")  # right eye
+            draw.ellipse([26, 38, 38, 50], fill="#2D2D2D")  # open mouth
+        if meeting:
+            # Red recording dot in bottom-right corner
+            draw = ImageDraw.Draw(img)
+            draw.ellipse([46, 46, 62, 62], fill="#FF0000", outline="#FFFFFF", width=1)
         return img
 
     MODELS = ["large-v3", "medium", "small", "base", "tiny"]
@@ -703,7 +977,61 @@ def create_tray_icon():
         status = "Enabled" if state.enabled else "Disabled"
         print(f"  🔄 Dictation {status}")
 
+    # ── Meeting mode ────────────────────────────────────────────────
+
+    def on_meeting_toggle(icon, item):
+        global _meeting_session
+        if _meeting_session and _meeting_session.running:
+            _meeting_session.stop()
+            _play_sound("stop")
+            _meeting_session = None
+            icon.icon = make_icon(meeting=False)
+        else:
+            mic = config.get("mic_device")
+            _meeting_session = MeetingSession(device_index=mic, config=config)
+            _meeting_session.start()
+            _play_sound("start")
+            icon.icon = make_icon(meeting=True)
+        icon.update_menu()
+
+    def _meeting_label(item):
+        if _meeting_session and _meeting_session.running:
+            return f"Stop Meeting ({_meeting_session.elapsed_str()})"
+        return "Start Meeting"
+
+    def on_open_meetings(icon, item):
+        MEETINGS_DIR.mkdir(parents=True, exist_ok=True)
+        if platform.system() == "Windows":
+            os.startfile(str(MEETINGS_DIR))
+        elif platform.system() == "Darwin":
+            import subprocess
+            subprocess.Popen(["open", str(MEETINGS_DIR)])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(MEETINGS_DIR)])
+
+    def _diarization_available():
+        return is_model_downloaded()
+
+    def on_toggle_diarization(icon, item):
+        if not _diarization_available():
+            # Model not downloaded — prompt user
+            _open_diarization_download_dialog(icon)
+            return
+        val = not config.get("meeting_diarization", False)
+        config["meeting_diarization"] = val
+        save_config_value("meeting_diarization", val)
+        print(f"  Speaker identification: {'on' if val else 'off'}")
+        icon.update_menu()
+
+    def on_rename_speakers(icon, item):
+        _open_rename_speakers_dialog()
+
     def on_quit(icon, item):
+        global _meeting_session
+        if _meeting_session and _meeting_session.running:
+            _meeting_session.stop()
+            _meeting_session = None
         _hotkey_listener.stop()
         try:
             from .transcribe import unload_model
@@ -773,41 +1101,78 @@ def create_tray_icon():
         return callback
 
     def is_current_device(device_name):
-        return lambda item: config.get("device", "gpu") == device_name.lower()
+        return lambda item: (config.get("device") or "gpu") == device_name.lower()
 
-    # --- Microphone selection ---
-    _input_devices = get_input_devices()
-
-    def make_mic_callback(dev_idx, dev_name):
+    # --- Language selection (multi-select checkboxes) ---
+    def make_lang_callback(lang_code):
         def callback(icon, item):
-            config["mic_device"] = dev_idx
-            save_config_value("mic_device", dev_idx)
-            print(f"  Microphone: {dev_name} (device {dev_idx})")
+            langs = list(config.get("languages", ["en"]))
+            if lang_code in langs:
+                if len(langs) > 1:
+                    langs.remove(lang_code)
+                else:
+                    return  # must keep at least one
+            else:
+                langs.append(lang_code)
+            config["languages"] = langs
+            save_config_value("languages", langs)
+            names = [LANG_LABELS.get(c, c) for c in langs]
+            print(f"  Languages: {', '.join(names)}")
             icon.update_menu()
         return callback
 
-    def on_mic_default(icon, item):
-        config.pop("mic_device", None)
-        save_config_value("mic_device", None)
-        print("  Microphone: System Default")
+    def is_lang_checked(lang_code):
+        return lambda item: lang_code in config.get("languages", ["en"])
+
+    def _lang_menu_label(item):
+        langs = config.get("languages", ["en"])
+        if len(langs) == 1:
+            return f"Language: {LANG_LABELS.get(langs[0], langs[0])}"
+        return f"Language: {len(langs)} selected (auto-detect)"
+
+    lang_menu = pystray.Menu(
+        *[pystray.MenuItem(
+            label, make_lang_callback(code),
+            checked=is_lang_checked(code),
+        ) for code, label in LANGUAGES]
+    )
+
+    # --- Microphone selection (refreshes on each menu open) ---
+    def _on_mic_click(icon, item):
+        label = str(item)
+        if label == "System Default":
+            config.pop("mic_device", None)
+            save_config_value("mic_device", None)
+            print("  Microphone: System Default")
+        else:
+            # Find device index by matching name from current device list
+            for idx, name in get_input_devices():
+                if name == label:
+                    config["mic_device"] = idx
+                    save_config_value("mic_device", idx)
+                    print(f"  Microphone: {name} (device {idx})")
+                    break
         icon.update_menu()
 
-    def is_mic_default():
-        return lambda item: config.get("mic_device") is None
+    def _build_mic_menu():
+        """Build mic menu dynamically — queries available devices each time."""
+        current = config.get("mic_device")
+        devices = get_input_devices()
+        items = [
+            pystray.MenuItem(
+                "System Default", _on_mic_click,
+                checked=lambda item: config.get("mic_device") is None, radio=True,
+            ),
+        ]
+        for idx, name in devices:
+            items.append(pystray.MenuItem(
+                name, _on_mic_click,
+                checked=(lambda i: lambda item: config.get("mic_device") == i)(idx),
+                radio=True,
+            ))
+        return items
 
-    def is_current_mic(dev_idx):
-        return lambda item: config.get("mic_device") == dev_idx
-
-    mic_menu = pystray.Menu(
-        pystray.MenuItem(
-            "System Default", on_mic_default,
-            checked=is_mic_default(), radio=True
-        ),
-        *[pystray.MenuItem(
-            name, make_mic_callback(idx, name),
-            checked=is_current_mic(idx), radio=True
-        ) for idx, name in _input_devices]
-    )
+    mic_menu = pystray.Menu(lambda: _build_mic_menu())
 
     # --- Model status ---
     def _model_status_label(item):
@@ -867,10 +1232,25 @@ def create_tray_icon():
     def is_current_backend(backend_name):
         return lambda item: config.get("backend", "local") == backend_name
 
+    def _diarization_label(item):
+        if _diarization_available():
+            on_off = "on" if config.get("meeting_diarization", False) else "off"
+            return f"Speaker Identification ({on_off})"
+        return "Speaker Identification (download)"
+
     menu = pystray.Menu(
         pystray.MenuItem(lambda item: f"Hold {_hotkey_display()} to dictate", None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(lambda item: "✓ Enabled" if state.enabled else "  Disabled", on_toggle),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(_meeting_label, on_meeting_toggle),
+        pystray.MenuItem("Open Meetings Folder", on_open_meetings),
+        pystray.MenuItem(
+            _diarization_label,
+            on_toggle_diarization,
+        ),
+        pystray.MenuItem("Rename Speakers...", on_rename_speakers),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Select Backend", pystray.Menu(
             pystray.MenuItem(
                 "Local", make_backend_callback("local"),
@@ -890,6 +1270,7 @@ def create_tray_icon():
                 d, make_device_callback(d), checked=is_current_device(d), radio=True
             ) for d in DEVICES]
         ), enabled=lambda item: config.get("backend", "local") == "local"),
+        pystray.MenuItem(_lang_menu_label, lang_menu),
         pystray.MenuItem("Select Microphone", mic_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(_model_status_label, None, enabled=False),
@@ -946,7 +1327,7 @@ def main() -> None:
                     print("  Downloading model (this may take a few minutes)...")
                 else:
                     print("  Loading model...")
-                device_pref = config.get("device")  # None = auto (GPU first)
+                device_pref = config.get("device", "gpu")
                 get_model(model_name, device_pref=device_pref)
                 print("  Model ready (hotkey active)")
             except (ImportError, RuntimeError) as e:

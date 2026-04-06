@@ -236,6 +236,9 @@ def build_pyinstaller() -> None:
         "faster_whisper",
     ]
 
+    # Diarization uses ONNX at runtime (onnxruntime already bundled via faster_whisper).
+    # No need to bundle speechbrain — the model is downloaded on demand by the app.
+
     args.append(str(ENTRY_SCRIPT))
 
     print(f"\n  Building for {system}...")

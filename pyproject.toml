@@ -23,6 +23,9 @@ dependencies = [
   "pyobjc-framework-Cocoa; platform_system == 'Darwin'",
 ]
 
+[project.optional-dependencies]
+export = ["speechbrain>=1.0.0", "torch>=2.1.0"]  # only needed to run scripts/export_ecapa_onnx.py
+
 [project.urls]
 Homepage = "https://github.com/parkercai/whispero"
 Issues = "https://github.com/parkercai/whispero/issues"
