@@ -215,6 +215,9 @@ def get_model(model_size: str = "large-v3", device_pref: str | None = None):
             # "gpu" or unset: try CUDA first, fall back to CPU
             devices = ("cuda", "cpu")
 
+        cache_dir = str(get_model_cache_dir())
+        local_only = is_model_cached(model_size)
+
         device = "cpu"
         for device in devices:
             try:
@@ -222,7 +225,8 @@ def get_model(model_size: str = "large-v3", device_pref: str | None = None):
                     model_size,
                     device=device,
                     compute_type="auto",
-                    download_root=str(get_model_cache_dir()),
+                    download_root=cache_dir,
+                    local_files_only=local_only,
                 )
                 break
             except Exception:

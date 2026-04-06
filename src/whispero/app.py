@@ -974,6 +974,34 @@ def _on_download_model(tray_icon=None):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _on_check_model_update(tray_icon=None):
+    """Re-download the model with local_files_only=False to pick up any updates."""
+    model_name = config.get("model", "large-v3")
+
+    def _run():
+        try:
+            from .transcribe import download_model
+            print(f"  Checking for {model_name} model updates...")
+            download_model(model_name, status_callback=lambda msg: print(f"  {msg}"))
+            print(f"  Model {model_name} is up to date")
+
+            # Reload model if it was already loaded
+            from .transcribe import _model, _model_lock
+            with _model_lock:
+                was_loaded = _model is not None
+            if was_loaded:
+                from .transcribe import reload_model
+                device_pref = config.get("device", "gpu")
+                reload_model(model_name, device_pref=device_pref)
+                print("  Model reloaded")
+        except Exception as e:
+            print(f"  Update check failed: {e}")
+        if tray_icon:
+            tray_icon.update_menu()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def create_tray_icon():
     """Create and run the system tray icon."""
     try:
@@ -1138,10 +1166,11 @@ def create_tray_icon():
             def _switch():
                 if config.get("backend", "local") == "local":
                     try:
-                        from .transcribe import get_model, is_model_cached
+                        from .transcribe import reload_model, is_model_cached
                         if not is_model_cached(model_name):
                             print(f"  Downloading {model_name}...")
-                        get_model(model_name)
+                        device_pref = config.get("device", "gpu")
+                        reload_model(model_name, device_pref=device_pref)
                         print(f"  {model_name} ready")
                     except Exception as e:
                         print(f"  Failed to load {model_name}: {e}")
@@ -1363,6 +1392,11 @@ def create_tray_icon():
             lambda icon, item: _on_download_model(icon),
             visible=lambda item: not _is_current_model_cached(),
         ),
+        pystray.MenuItem(
+            "Check for Model Updates",
+            lambda icon, item: _on_check_model_update(icon),
+            visible=lambda item: _is_current_model_cached(),
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Change Sounds...", on_change_sounds),
         pystray.MenuItem("Edit Dictionary", on_edit_dict),
@@ -1498,6 +1532,110 @@ def _open_model_download_dialog(model_name: str) -> bool:
     return result[0]
 
 
+def _check_cuda_available() -> bool:
+    """Check if CUDA libraries are loadable."""
+    try:
+        import ctypes
+        ctypes.cdll.LoadLibrary("cublas64_12.dll")
+        return True
+    except OSError:
+        return False
+
+
+def _open_cuda_missing_dialog() -> str:
+    """Show dialog when CUDA is missing. Returns 'cpu', 'install', or 'quit'."""
+    result = ["cpu"]
+
+    def _run():
+        import tkinter as tk
+        import webbrowser
+
+        BG = "#1a1a2e"
+        ACCENT = "#e94560"
+        TEXT = "#eaeaea"
+        TEXT_DIM = "#8892a0"
+        LINK = "#5dade2"
+
+        root = tk.Tk()
+        root.title("WhisperO — CUDA Not Found")
+        root.configure(bg=BG)
+        root.resizable(False, False)
+
+        w, h = 520, 300
+        x = (root.winfo_screenwidth() - w) // 2
+        y = (root.winfo_screenheight() - h) // 2
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.attributes("-topmost", True)
+
+        tk.Label(
+            root, text="CUDA libraries not found",
+            font=("Segoe UI", 13, "bold"), bg=BG, fg=TEXT,
+        ).pack(pady=(20, 5))
+
+        tk.Label(
+            root,
+            text="An NVIDIA GPU was detected, but CUDA runtime\n"
+                 "libraries are not installed. GPU transcription\n"
+                 "requires CUDA Toolkit 12.",
+            font=("Segoe UI", 10), bg=BG, fg=TEXT_DIM, justify=tk.CENTER,
+        ).pack(pady=(0, 10))
+
+        # Instructions
+        tk.Label(
+            root,
+            text="To install: download CUDA Toolkit 12.2, run the installer,\n"
+                 'select "Custom" and check only CUDA > Runtime > Libraries.\n'
+                 "Then restart WhisperO.",
+            font=("Segoe UI", 9), bg=BG, fg=TEXT_DIM, justify=tk.CENTER,
+        ).pack(pady=(0, 5))
+
+        cuda_url = "https://developer.nvidia.com/cuda-12-2-0-download-archive"
+
+        link = tk.Label(
+            root, text=cuda_url,
+            font=("Segoe UI", 9, "underline"), bg=BG, fg=LINK, cursor="hand2",
+        )
+        link.pack(pady=(0, 15))
+        link.bind("<Button-1>", lambda e: webbrowser.open(cuda_url))
+
+        btn_frame = tk.Frame(root, bg=BG)
+        btn_frame.pack(pady=5)
+
+        def on_cpu():
+            result[0] = "cpu"
+            root.destroy()
+
+        def on_install():
+            webbrowser.open(cuda_url)
+            result[0] = "quit"
+            root.destroy()
+
+        def on_close():
+            result[0] = "cpu"
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", on_close)
+
+        tk.Button(
+            btn_frame, text="Continue on CPU", font=("Segoe UI", 10, "bold"),
+            bg=ACCENT, fg="white", activebackground="#c73a52", activeforeground="white",
+            relief=tk.FLAT, padx=20, pady=5, cursor="hand2",
+            command=on_cpu,
+        ).pack(side=tk.LEFT, padx=8)
+
+        tk.Button(
+            btn_frame, text="Download CUDA & Quit", font=("Segoe UI", 10),
+            bg="#2a2a4a", fg=TEXT_DIM, activebackground="#3a3a5a", activeforeground=TEXT,
+            relief=tk.FLAT, padx=20, pady=5, cursor="hand2",
+            command=on_install,
+        ).pack(side=tk.LEFT, padx=8)
+
+        root.mainloop()
+
+    _run()
+    return result[0]
+
+
 def _download_model_and_exit() -> None:
     """Download the default model and exit. Used by the installer post-install step."""
     from .transcribe import download_model, is_model_cached
@@ -1531,6 +1669,19 @@ def main() -> None:
     if backend == "local":
         model_name = config.get("model", "large-v3")
         print(f"WhisperO (local, model: {model_name})")
+
+        # Check CUDA availability when GPU is selected
+        device_pref = config.get("device", "gpu")
+        if device_pref == "gpu" and platform.system() == "Windows":
+            if not _check_cuda_available():
+                choice = _open_cuda_missing_dialog()
+                if choice == "cpu":
+                    config["device"] = "cpu"
+                    save_config_value("device", "cpu")
+                    print("  CUDA not found, using CPU")
+                elif choice == "quit":
+                    print("  Please install CUDA and restart WhisperO")
+                    sys.exit(0)
 
         # First launch: show download dialog if model isn't cached
         from .transcribe import is_model_cached

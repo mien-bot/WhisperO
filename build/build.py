@@ -247,6 +247,19 @@ def build_pyinstaller() -> None:
     finally:
         remove_entry_script()
 
+    # Remove large CUDA DLLs — users can drop them in manually for GPU support
+    if system == "Windows":
+        app_dir = DIST / APP_NAME / "_internal"
+        removed = 0
+        for pattern in ["cublas64_*.dll", "cublasLt64_*.dll"]:
+            for dll in app_dir.glob(pattern):
+                size_mb = dll.stat().st_size / 1024 / 1024
+                dll.unlink()
+                removed += size_mb
+                print(f"  ✓ Removed {dll.name} ({size_mb:.0f} MB) — not needed for CPU mode")
+        if removed:
+            print(f"  ✓ Saved {removed:.0f} MB (drop CUDA DLLs into install folder for GPU)")
+
     if system == "Darwin":
         app_path = DIST / f"{APP_NAME}.app"
         if not app_path.exists():
