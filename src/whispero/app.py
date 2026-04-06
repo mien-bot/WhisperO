@@ -127,7 +127,9 @@ class _HotkeyListener:
                     self._held_names.add(name)
                 if self.trigger_names.issubset(self._held_names) and not self._recording_active:
                     self._recording_active = True
-                    on_hotkey_press()
+                    # Run in thread — blocking the Windows keyboard hook callback
+                    # for >300ms causes the OS to silently kill the hook.
+                    threading.Thread(target=on_hotkey_press, daemon=True).start()
             except Exception as e:
                 print(f"  ❌ Hotkey press error: {e}")
 
@@ -136,7 +138,7 @@ class _HotkeyListener:
                 name = _key_to_name(key)
                 if name and name in self.trigger_names and self._recording_active:
                     self._recording_active = False
-                    on_hotkey_release()
+                    threading.Thread(target=on_hotkey_release, daemon=True).start()
                 if name:
                     self._held_names.discard(name)
             except Exception as e:
@@ -1330,8 +1332,8 @@ def main() -> None:
                 device_pref = config.get("device", "gpu")
                 get_model(model_name, device_pref=device_pref)
                 print("  Model ready (hotkey active)")
-            except (ImportError, RuntimeError) as e:
-                print(f"  faster-whisper not available ({e}), falling back to server mode")
+            except Exception as e:
+                print(f"  ❌ Model loading failed ({e}), falling back to server mode")
                 config["backend"] = "server"
 
         threading.Thread(target=_load_model_bg, daemon=True).start()

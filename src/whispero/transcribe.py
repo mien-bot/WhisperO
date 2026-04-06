@@ -90,9 +90,8 @@ def get_model(model_size: str = "large-v3", device_pref: str | None = None):
         # Determine device order based on preference
         if device_pref == "cpu":
             devices = ("cpu",)
-        elif device_pref == "gpu":
-            devices = ("cuda",)
         else:
+            # "gpu" or unset: try CUDA first, fall back to CPU
             devices = ("cuda", "cpu")
 
         device = "cpu"
