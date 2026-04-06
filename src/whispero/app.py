@@ -981,6 +981,22 @@ def create_tray_icon():
 
     # ── Meeting mode ────────────────────────────────────────────────
 
+    # Live timer: refresh the tray menu while a meeting is running
+    _menu_timer_stop = threading.Event()
+
+    def _start_menu_timer(ic):
+        _menu_timer_stop.clear()
+        def _tick():
+            while not _menu_timer_stop.wait(timeout=5):
+                try:
+                    ic.update_menu()
+                except Exception:
+                    pass
+        threading.Thread(target=_tick, daemon=True).start()
+
+    def _stop_menu_timer():
+        _menu_timer_stop.set()
+
     def on_meeting_toggle(icon, item):
         global _meeting_session
         if _meeting_session and _meeting_session.running:
@@ -988,12 +1004,14 @@ def create_tray_icon():
             _play_sound("stop")
             _meeting_session = None
             icon.icon = make_icon(meeting=False)
+            _stop_menu_timer()
         else:
             mic = config.get("mic_device")
             _meeting_session = MeetingSession(device_index=mic, config=config)
             _meeting_session.start()
             _play_sound("start")
             icon.icon = make_icon(meeting=True)
+            _start_menu_timer(icon)
         icon.update_menu()
 
     def _meeting_label(item):
@@ -1029,8 +1047,33 @@ def create_tray_icon():
     def on_rename_speakers(icon, item):
         _open_rename_speakers_dialog()
 
+    # ── Attendees selector ──────────────────────────────────────────
+
+    def make_attendees_callback(n):
+        def callback(icon, item):
+            config["meeting_max_speakers"] = n
+            save_config_value("meeting_max_speakers", n)
+            print(f"  Meeting attendees set to {n}")
+            icon.update_menu()
+        return callback
+
+    def is_current_attendees(n):
+        return lambda item: config.get("meeting_max_speakers", 10) == n
+
+    def _attendees_label(item):
+        n = config.get("meeting_max_speakers", 10)
+        return f"Attendees: {n}"
+
+    attendees_menu = pystray.Menu(
+        *[pystray.MenuItem(
+            str(n), make_attendees_callback(n),
+            checked=is_current_attendees(n), radio=True,
+        ) for n in range(2, 11)]
+    )
+
     def on_quit(icon, item):
         global _meeting_session
+        _stop_menu_timer()
         if _meeting_session and _meeting_session.running:
             _meeting_session.stop()
             _meeting_session = None
@@ -1251,6 +1294,7 @@ def create_tray_icon():
             _diarization_label,
             on_toggle_diarization,
         ),
+        pystray.MenuItem(_attendees_label, attendees_menu),
         pystray.MenuItem("Rename Speakers...", on_rename_speakers),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Select Backend", pystray.Menu(
