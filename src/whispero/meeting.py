@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .audio import CHANNELS, SAMPLE_RATE, get_shared_stream
+from .audio import CHANNELS, SAMPLE_RATE, get_loopback_stream, get_shared_stream, LoopbackStream
 from .config import MEETINGS_DIR, load_config
 from .transcribe import transcribe_meeting_segment, transcription_lock
 
@@ -35,11 +35,13 @@ class MeetingRecorder:
         device_index: int | None = None,
         segment_duration: int = 10,
         overlap: float = 0.5,
+        audio_source: str = "mic",
     ):
         self._session = session
         self._device_index = device_index
         self._segment_duration = segment_duration
         self._overlap = overlap
+        self._audio_source = audio_source  # "mic", "system", or "both"
 
         # Audio buffering — bounded ring buffer
         self._chunk_buffer: collections.deque[np.ndarray] = collections.deque(
@@ -61,8 +63,24 @@ class MeetingRecorder:
         self._running = True
         self._stop_event.clear()
 
-        stream = get_shared_stream(self._device_index)
-        stream.add_consumer("meeting", self._on_audio)
+        source = self._audio_source
+        if source in ("mic", "both"):
+            stream = get_shared_stream(self._device_index)
+            stream.add_consumer("meeting", self._on_audio)
+            print(f"  Meeting: mic capture active")
+
+        if source in ("system", "both"):
+            if LoopbackStream.is_available():
+                loopback = get_loopback_stream()
+                loopback.add_consumer("meeting", self._on_audio)
+                print(f"  Meeting: system audio capture active")
+            else:
+                print("  System audio capture unavailable (WASAPI loopback not found)")
+                if source == "system":
+                    # Fall back to mic if system-only was requested but unavailable
+                    stream = get_shared_stream(self._device_index)
+                    stream.add_consumer("meeting", self._on_audio)
+                    print(f"  Meeting: falling back to mic capture")
 
         self._segment_thread = threading.Thread(
             target=self._segment_loop, daemon=True, name="meeting-segment",
@@ -79,6 +97,10 @@ class MeetingRecorder:
         self._stop_event.set()
 
         get_shared_stream().remove_consumer("meeting")
+        try:
+            get_loopback_stream().remove_consumer("meeting")
+        except Exception:
+            pass
 
         # Sentinel to unblock the transcribe thread
         self._segment_queue.put(None)
@@ -323,11 +345,13 @@ class MeetingSession:
         seg_dur = self._config.get("meeting_segment_duration", 10)
         overlap = self._config.get("meeting_overlap", 0.5)
 
+        audio_source = self._config.get("meeting_audio_source", "mic")
         self._recorder = MeetingRecorder(
             session=self,
             device_index=self._device_index,
             segment_duration=seg_dur,
             overlap=overlap,
+            audio_source=audio_source,
         )
         self._recorder.start()
         print(f"  Meeting started: {self._txt_path.name}")

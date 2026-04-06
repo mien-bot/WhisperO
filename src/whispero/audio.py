@@ -131,6 +131,143 @@ def get_shared_stream(device_index: int | None = None) -> SharedStream:
 
 # ── Helpers ────────���─────────────────────────────────���──────────────────
 
+class LoopbackStream:
+    """Captures system/desktop audio via WASAPI loopback (Windows only).
+
+    Similar to SharedStream but uses pyaudiowpatch to record whatever
+    is playing through the speakers.  Audio is resampled to 16 kHz mono
+    to match the mic stream format.
+    """
+
+    def __init__(self):
+        self._stream = None
+        self._pa = None
+        self._consumers: dict[str, Callable] = {}
+        self._lock = threading.Lock()
+        self._device_info: dict | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._stream is not None and self._stream.is_active()
+
+    @staticmethod
+    def is_available() -> bool:
+        """Check if WASAPI loopback is supported on this system."""
+        try:
+            import pyaudiowpatch as pyaudio
+            p = pyaudio.PyAudio()
+            try:
+                p.get_host_api_info_by_type(pyaudio.paWASAPI)
+                loopback = p.get_default_wasapi_loopback()
+                return loopback is not None
+            except (OSError, StopIteration):
+                return False
+            finally:
+                p.terminate()
+        except ImportError:
+            return False
+
+    def add_consumer(self, name: str, callback: Callable) -> None:
+        need_start = False
+        with self._lock:
+            self._consumers[name] = callback
+            if self._stream is None or not self._stream.is_active():
+                need_start = True
+        if need_start:
+            self._start_stream()
+
+    def remove_consumer(self, name: str) -> None:
+        should_stop = False
+        with self._lock:
+            self._consumers.pop(name, None)
+            if not self._consumers and self._stream:
+                should_stop = True
+        if should_stop:
+            self._stop_stream()
+
+    def _start_stream(self) -> None:
+        import pyaudiowpatch as pyaudio
+
+        self._pa = pyaudio.PyAudio()
+        try:
+            loopback = self._pa.get_default_wasapi_loopback()
+        except (OSError, StopIteration):
+            print("  No WASAPI loopback device found")
+            self._pa.terminate()
+            self._pa = None
+            return
+
+        self._device_info = loopback
+        src_rate = int(loopback["defaultSampleRate"])
+        src_channels = loopback["maxInputChannels"]
+        print(f"  System audio: {loopback['name']} ({src_rate}Hz, {src_channels}ch)")
+
+        def audio_callback(in_data, frame_count, time_info, status):
+            audio = np.frombuffer(in_data, dtype=np.int16)
+            # Convert to mono if stereo
+            if src_channels > 1:
+                audio = audio.reshape(-1, src_channels).mean(axis=1).astype(np.int16)
+            # Resample to 16 kHz if needed
+            if src_rate != SAMPLE_RATE:
+                num_samples = int(len(audio) * SAMPLE_RATE / src_rate)
+                indices = np.linspace(0, len(audio) - 1, num_samples).astype(int)
+                audio = audio[indices]
+            data = audio.reshape(-1, 1)
+            with self._lock:
+                for cb in list(self._consumers.values()):
+                    try:
+                        cb(data)
+                    except Exception:
+                        pass
+            return (None, pyaudio.paContinue)
+
+        self._stream = self._pa.open(
+            format=pyaudio.paInt16,
+            channels=src_channels,
+            rate=src_rate,
+            input=True,
+            input_device_index=loopback["index"],
+            frames_per_buffer=1024,
+            stream_callback=audio_callback,
+        )
+        self._stream.start_stream()
+
+    def _stop_stream(self) -> None:
+        if self._stream:
+            try:
+                self._stream.stop_stream()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        if self._pa:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            self._pa = None
+
+    def stop(self) -> None:
+        with self._lock:
+            self._consumers.clear()
+        self._stop_stream()
+
+
+# ── Module-level loopback stream ─────────────────────────────────────
+
+_loopback_stream: LoopbackStream | None = None
+_loopback_stream_lock = threading.Lock()
+
+
+def get_loopback_stream() -> LoopbackStream:
+    """Get or create the module-level LoopbackStream."""
+    global _loopback_stream
+    with _loopback_stream_lock:
+        if _loopback_stream is None:
+            _loopback_stream = LoopbackStream()
+        return _loopback_stream
+
+
 def get_input_devices() -> list[tuple[int, str]]:
     """Return list of (device_index, device_name) for all input devices."""
     result = []

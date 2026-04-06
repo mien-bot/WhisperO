@@ -1350,6 +1350,32 @@ def create_tray_icon():
             return f"Speaker Identification ({on_off})"
         return "Speaker Identification (download)"
 
+    # --- Meeting audio source ---
+    _AUDIO_SOURCES = [("mic", "Microphone Only"), ("system", "System Audio Only"), ("both", "Mic + System Audio")]
+
+    def _make_audio_source_callback(source_key):
+        def callback(icon, item):
+            config["meeting_audio_source"] = source_key
+            save_config_value("meeting_audio_source", source_key)
+            label = dict(_AUDIO_SOURCES).get(source_key, source_key)
+            print(f"  Meeting audio: {label}")
+            icon.update_menu()
+        return callback
+
+    def _is_current_audio_source(source_key):
+        return lambda item: config.get("meeting_audio_source", "mic") == source_key
+
+    def _audio_source_available(item):
+        from .audio import LoopbackStream
+        return LoopbackStream.is_available()
+
+    audio_source_menu = pystray.Menu(
+        *[pystray.MenuItem(
+            label, _make_audio_source_callback(key),
+            checked=_is_current_audio_source(key), radio=True,
+        ) for key, label in _AUDIO_SOURCES],
+    )
+
     menu = pystray.Menu(
         pystray.MenuItem(lambda item: f"Hold {_hotkey_display()} to dictate", None, enabled=False),
         pystray.Menu.SEPARATOR,
@@ -1357,6 +1383,7 @@ def create_tray_icon():
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(_meeting_label, on_meeting_toggle),
         pystray.MenuItem("Open Meetings Folder", on_open_meetings),
+        pystray.MenuItem("Meeting Audio Source", audio_source_menu),
         pystray.MenuItem(
             _diarization_label,
             on_toggle_diarization,

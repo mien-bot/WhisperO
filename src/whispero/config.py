@@ -21,6 +21,7 @@ DEFAULTS = {
     "meeting_segment_duration": 10,    # seconds per segment
     "meeting_overlap": 0.5,            # overlap between segments (avoid cut words)
     "meeting_auto_open": True,         # open transcript when meeting stops
+    "meeting_audio_source": "mic",     # "mic", "system", or "both"
     "meeting_diarization": False,      # speaker identification (requires speechbrain)
     "meeting_diarization_threshold": 0.55,  # speaker matching sensitivity (lower = more lenient)
     "meeting_max_speakers": 10,
