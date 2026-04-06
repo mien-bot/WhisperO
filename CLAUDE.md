@@ -65,7 +65,8 @@ scripts/
 
 ## Build notes
 
-- Build output: `dist/WhisperO/WhisperO.exe` (~278 MB)
+- Standalone app: `dist/WhisperO/WhisperO.exe` (~278 MB folder)
+- Windows installer: `dist/WhisperO-Setup.exe` (~80 MB) — built with `--installer` flag, requires Inno Setup 6 (`build/installer.iss`)
 - Must use `PYTHONIOENCODING=utf-8` on Windows (build script prints Unicode)
 - Diarization model is NOT bundled — downloaded at runtime from GitHub Releases (`models-v1` tag)
 - The `models/` directory is gitignored (exported files are on GitHub Releases)
