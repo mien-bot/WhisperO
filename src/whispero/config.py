@@ -22,7 +22,7 @@ DEFAULTS = {
     "meeting_overlap": 0.5,            # overlap between segments (avoid cut words)
     "meeting_auto_open": True,         # open transcript when meeting stops
     "meeting_diarization": False,      # speaker identification (requires speechbrain)
-    "meeting_diarization_threshold": 0.75,  # speaker matching sensitivity
+    "meeting_diarization_threshold": 0.55,  # speaker matching sensitivity (lower = more lenient)
     "meeting_max_speakers": 10,
     "meeting_speaker_names": {},        # e.g. {"1": "Ian", "2": "Parker"}
 }

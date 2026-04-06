@@ -246,9 +246,7 @@ class MeetingRecorder:
     def _write_with_diarization(self, segments, segment_start, audio_float, diarizer):
         """Assign speaker labels and write segments."""
         try:
-            embeddings = diarizer.extract_embeddings(audio_float, segments)
-            speaker_ids = diarizer.assign_speakers(embeddings)
-            del embeddings  # free embedding list
+            speaker_ids = diarizer.identify_speakers(audio_float, segments)
             names = self._session.speaker_names
             for (start, end, text), spk_id in zip(segments, speaker_ids):
                 key = str(spk_id + 1)

@@ -133,6 +133,39 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
+# ── Segment merging ─────────────────────────────────────────────────────
+
+_MIN_EMBED_SECS = 1.5   # minimum audio for a reliable voice embedding
+_TURN_GAP_SECS = 0.8    # merge segments within this gap into one turn
+_CENTROID_MAX_WEIGHT = 20  # cap running-mean weight so centroids stay adaptive
+
+
+def _merge_into_turns(
+    segments: list[tuple[float, float, str]],
+    gap: float = _TURN_GAP_SECS,
+) -> list[tuple[float, float, list[int]]]:
+    """Group adjacent segments (within *gap* seconds) into speaking turns.
+
+    Returns list of (turn_start, turn_end, [original_segment_indices]).
+    """
+    if not segments:
+        return []
+    turns: list[tuple[float, float, list[int]]] = []
+    start, end = segments[0][0], segments[0][1]
+    indices = [0]
+    for i in range(1, len(segments)):
+        s, e, _ = segments[i]
+        if s - end <= gap:
+            end = max(end, e)
+            indices.append(i)
+        else:
+            turns.append((start, end, indices))
+            start, end = s, e
+            indices = [i]
+    turns.append((start, end, indices))
+    return turns
+
+
 # ── Speaker diarizer ────────────────────────────────────────────────────
 
 class SpeakerDiarizer:
@@ -141,7 +174,7 @@ class SpeakerDiarizer:
     def __init__(
         self,
         device: str = "cpu",
-        threshold: float = 0.75,
+        threshold: float = 0.55,
         max_speakers: int = 10,
     ):
         self._threshold = threshold
@@ -174,51 +207,78 @@ class SpeakerDiarizer:
         device_label = "GPU" if "CUDA" in provider_used else "CPU"
         print(f"  Speaker diarization model loaded (ONNX, {device_label})")
 
-    def extract_embeddings(
+    # ── Public API ──────────────────────────────────────────────────────
+
+    def identify_speakers(
         self,
         audio: np.ndarray,
         segments: list[tuple[float, float, str]],
-    ) -> list[np.ndarray]:
-        """Extract a 192-dim speaker embedding for each transcribed segment."""
-        embeddings: list[np.ndarray] = []
+    ) -> list[int]:
+        """Full diarization pipeline for one chunk of meeting audio.
 
-        for start, end, _text in segments:
-            start_sample = int(start * SAMPLE_RATE)
-            end_sample = int(end * SAMPLE_RATE)
+        1. Merge adjacent Whisper segments into speaking turns (longer audio
+           = much more reliable voice embeddings).
+        2. Extract one ECAPA-TDNN embedding per turn (skip turns < 1.5 s).
+        3. Online-cluster turns against running centroids.
+        4. Map turn-level speaker IDs back to the original segments.
 
-            if start_sample >= len(audio) or end_sample <= start_sample:
-                embeddings.append(np.zeros(192))
-                continue
+        Returns one speaker-ID (0-based) per input segment.
+        """
+        if not segments:
+            return []
 
-            end_sample = min(end_sample, len(audio))
-            segment_audio = audio[start_sample:end_sample]
+        # 1. Merge adjacent segments into speaking turns
+        turns = _merge_into_turns(segments)
 
-            # Compute Mel filterbank features
-            fbank = _compute_fbank(segment_audio)
-            fbank = _normalize_features(fbank, self._stats_path)
+        # 2. Extract one embedding per turn (None for short turns)
+        turn_embeddings: list[np.ndarray | None] = []
+        for t_start, t_end, _ in turns:
+            duration = t_end - t_start
+            s = int(t_start * SAMPLE_RATE)
+            e = min(int(t_end * SAMPLE_RATE), len(audio))
+            if duration < _MIN_EMBED_SECS or e <= s:
+                turn_embeddings.append(None)
+            else:
+                turn_embeddings.append(self._extract_embedding(audio[s:e]))
 
-            # Run ONNX inference: (1, time, 80) -> (1, 192)
-            fbank_input = fbank[np.newaxis, :, :]  # add batch dim
-            result = self._session.run(None, {"features": fbank_input})
-            embedding = result[0].flatten()
+        # 3. Assign speaker IDs to turns
+        turn_ids = self._cluster_turns(turn_embeddings)
 
-            embeddings.append(embedding)
+        # 4. Map back to original segments
+        result = [0] * len(segments)
+        for turn_idx, (_, _, seg_indices) in enumerate(turns):
+            for si in seg_indices:
+                result[si] = turn_ids[turn_idx]
+        return result
 
-        return embeddings
+    # ── Internals ───────────────────────────────────────────────────────
 
-    def assign_speakers(self, embeddings: list[np.ndarray]) -> list[int]:
-        """Online clustering: cosine similarity against running centroids."""
+    def _extract_embedding(self, audio: np.ndarray) -> np.ndarray:
+        """Extract a 192-dim speaker embedding from a raw float32 audio array."""
+        fbank = _compute_fbank(audio)
+        fbank = _normalize_features(fbank, self._stats_path)
+        fbank_input = fbank[np.newaxis, :, :]  # (1, time, 80)
+        result = self._session.run(None, {"features": fbank_input})
+        return result[0].flatten()
+
+    def _cluster_turns(
+        self, embeddings: list[np.ndarray | None],
+    ) -> list[int]:
+        """Assign speakers to turns, handling short turns by temporal fallback."""
         speaker_ids: list[int] = []
+        last_assigned = 0  # fallback for short / silent turns
 
         for emb in embeddings:
-            if np.allclose(emb, 0):
-                speaker_ids.append(0)
+            if emb is None or np.allclose(emb, 0):
+                # Short turn — inherit the most recent speaker
+                speaker_ids.append(last_assigned)
                 continue
 
             if not self._centroids:
                 self._centroids.append(emb.copy())
                 self._centroid_counts.append(1)
                 speaker_ids.append(0)
+                last_assigned = 0
                 continue
 
             similarities = [_cosine_similarity(emb, c) for c in self._centroids]
@@ -226,16 +286,24 @@ class SpeakerDiarizer:
             best_sim = similarities[best_idx]
 
             if best_sim >= self._threshold:
-                n = self._centroid_counts[best_idx]
-                self._centroids[best_idx] = (self._centroids[best_idx] * n + emb) / (n + 1)
-                self._centroid_counts[best_idx] = n + 1
+                # Match — update centroid (capped running mean)
+                n = min(self._centroid_counts[best_idx], _CENTROID_MAX_WEIGHT)
+                self._centroids[best_idx] = (
+                    self._centroids[best_idx] * n + emb
+                ) / (n + 1)
+                self._centroid_counts[best_idx] += 1
                 speaker_ids.append(best_idx)
+                last_assigned = best_idx
             elif len(self._centroids) < self._max_speakers:
+                # New speaker
                 new_idx = len(self._centroids)
                 self._centroids.append(emb.copy())
                 self._centroid_counts.append(1)
                 speaker_ids.append(new_idx)
+                last_assigned = new_idx
             else:
+                # At speaker limit — assign to closest
                 speaker_ids.append(best_idx)
+                last_assigned = best_idx
 
         return speaker_ids
