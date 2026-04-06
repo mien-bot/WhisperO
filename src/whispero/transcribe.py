@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import io
+import os
 import sys
 import threading
 from pathlib import Path
@@ -54,11 +55,129 @@ def is_model_cached(model_size: str = "large-v3") -> bool:
     return snapshots_dir.exists() and any(path.is_file() for path in snapshots_dir.rglob("*"))
 
 
-def download_model(model_size: str = "large-v3") -> None:
-    """Download the model files without loading into memory."""
-    from faster_whisper.utils import download_model as _dl
+_HF_FALLBACK_MIRRORS = [
+    "https://hf-mirror.com",
+]
+
+
+def _apply_hf_mirror(mirror: str = "") -> None:
+    """Set HF_ENDPOINT. Uses config value, or the provided override."""
+    if not mirror:
+        from .config import load_config
+        mirror = load_config().get("hf_mirror", "")
+    if mirror:
+        os.environ["HF_ENDPOINT"] = mirror
+    elif "HF_ENDPOINT" in os.environ:
+        del os.environ["HF_ENDPOINT"]
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """Check if an exception looks like a blocked/unreachable host."""
+    msg = str(exc).lower()
+    keywords = ["ssl", "handshake", "connection", "timeout", "refused",
+                "unreachable", "network", "errno", "resolve"]
+    return any(k in msg for k in keywords)
+
+
+def download_model(model_size: str = "large-v3", progress_callback=None,
+                   status_callback=None) -> None:
+    """Download the model files without loading into memory.
+
+    Args:
+        model_size: Model size string (e.g. "large-v3").
+        progress_callback: Optional callable(downloaded_bytes, total_bytes).
+        status_callback: Optional callable(message) for status updates.
+    """
+    import huggingface_hub
+    from .config import load_config
+
     cache_dir = str(get_model_cache_dir())
-    _dl(model_size, cache_dir=cache_dir)
+    user_mirror = load_config().get("hf_mirror", "")
+
+    # Build list of endpoints to try: user-configured mirror (or default HF), then fallbacks
+    endpoints = []
+    if user_mirror:
+        endpoints.append(user_mirror)
+    else:
+        endpoints.append("")  # empty = default huggingface.co
+    for mirror in _HF_FALLBACK_MIRRORS:
+        if mirror not in endpoints:
+            endpoints.append(mirror)
+
+    last_error = None
+    for endpoint in endpoints:
+        _apply_hf_mirror(endpoint)
+        label = endpoint or "huggingface.co"
+
+        if status_callback:
+            status_callback(f"Connecting to {label}...")
+
+        try:
+            if progress_callback is None:
+                from faster_whisper.utils import download_model as _dl
+                _dl(model_size, cache_dir=cache_dir)
+            else:
+                _download_with_progress(model_size, cache_dir, progress_callback,
+                                        huggingface_hub)
+            # Success — save working mirror for future use
+            if endpoint:
+                from .config import save_config_value
+                save_config_value("hf_mirror", endpoint)
+            return
+        except Exception as e:
+            last_error = e
+            if _is_connection_error(e) and endpoint != endpoints[-1]:
+                print(f"  {label} failed ({e}), trying next mirror...")
+                continue
+            raise
+
+    raise last_error  # type: ignore[misc]
+
+
+def _download_with_progress(model_size, cache_dir, progress_callback, huggingface_hub):
+    """Download model with progress tracking via a custom tqdm wrapper."""
+    from faster_whisper.utils import _MODELS
+
+    repo_id = _MODELS.get(model_size, model_size)
+    allow_patterns = [
+        "config.json", "preprocessor_config.json", "model.bin",
+        "tokenizer.json", "vocabulary.*",
+    ]
+
+    class _ProgressTqdm:
+        """Minimal tqdm-like class that forwards progress to a callback."""
+        _cumulative = 0
+        _total = 0
+
+        def __init__(self, *args, **kwargs):
+            self.total = kwargs.get("total", 0)
+            _ProgressTqdm._total += self.total or 0
+            self._n = 0
+
+        def update(self, n=1):
+            self._n += n
+            _ProgressTqdm._cumulative += n
+            if progress_callback:
+                progress_callback(_ProgressTqdm._cumulative, _ProgressTqdm._total)
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    _ProgressTqdm._cumulative = 0
+    _ProgressTqdm._total = 0
+
+    huggingface_hub.snapshot_download(
+        repo_id,
+        cache_dir=cache_dir,
+        allow_patterns=allow_patterns,
+        tqdm_class=_ProgressTqdm,
+    )
 
 
 def get_model(model_size: str = "large-v3", device_pref: str | None = None):
@@ -79,6 +198,8 @@ def get_model(model_size: str = "large-v3", device_pref: str | None = None):
                     torch.cuda.empty_cache()
             except Exception:
                 pass
+
+        _apply_hf_mirror()
 
         try:
             from faster_whisper import WhisperModel

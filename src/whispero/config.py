@@ -25,6 +25,7 @@ DEFAULTS = {
     "meeting_diarization_threshold": 0.55,  # speaker matching sensitivity (lower = more lenient)
     "meeting_max_speakers": 10,
     "meeting_speaker_names": {},        # e.g. {"1": "Ian", "2": "Parker"}
+    "hf_mirror": "",                    # HuggingFace mirror URL (e.g. "https://hf-mirror.com")
 }
 
 SOUND_OPTIONS = [
@@ -110,6 +111,10 @@ def _apply_env(config: dict[str, Any]) -> dict[str, Any]:
         model = env_model.strip().lower()
         if model in VALID_MODELS:
             updated["model"] = model
+
+    env_mirror = os.environ.get("WHISPERO_HF_MIRROR")
+    if env_mirror:
+        updated["hf_mirror"] = env_mirror.strip()
 
     return updated
 

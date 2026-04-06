@@ -936,6 +936,44 @@ def on_hotkey_release() -> None:
     threading.Thread(target=do_transcribe, daemon=True).start()
 
 
+def _is_current_model_cached() -> bool:
+    """Check if the currently selected model is already downloaded."""
+    from .transcribe import is_model_cached
+    return is_model_cached(config.get("model", "large-v3"))
+
+
+def _on_download_model(tray_icon=None):
+    """Handle 'Download Model' menu click — opens download dialog in a thread."""
+    model_name = config.get("model", "large-v3")
+
+    def _run():
+        downloaded = _open_model_download_dialog(model_name)
+        if downloaded:
+            # Switch back to local backend and load the model
+            config["backend"] = "local"
+            save_config_value("backend", "local")
+            if tray_icon:
+                tray_icon.update_menu()
+
+            def _load():
+                try:
+                    from .transcribe import get_model
+                    print("  Loading model...")
+                    device_pref = config.get("device", "gpu")
+                    get_model(model_name, device_pref=device_pref)
+                    print("  Model ready (hotkey active)")
+                except Exception as e:
+                    print(f"  Model loading failed ({e})")
+                if tray_icon:
+                    tray_icon.update_menu()
+
+            threading.Thread(target=_load, daemon=True).start()
+        if tray_icon:
+            tray_icon.update_menu()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def create_tray_icon():
     """Create and run the system tray icon."""
     try:
@@ -1320,6 +1358,11 @@ def create_tray_icon():
         pystray.MenuItem("Select Microphone", mic_menu),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(_model_status_label, None, enabled=False),
+        pystray.MenuItem(
+            "Download Model...",
+            lambda icon, item: _on_download_model(icon),
+            visible=lambda item: not _is_current_model_cached(),
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Change Sounds...", on_change_sounds),
         pystray.MenuItem("Edit Dictionary", on_edit_dict),
@@ -1330,6 +1373,129 @@ def create_tray_icon():
 
     icon = pystray.Icon("WhisperO", make_icon(), "WhisperO", menu)
     return icon
+
+
+def _open_model_download_dialog(model_name: str) -> bool:
+    """Show a first-launch dialog to download the Whisper model. Returns True if downloaded."""
+
+    result = [False]
+
+    def _run():
+        import tkinter as tk
+        from tkinter import ttk
+
+        BG = "#1a1a2e"
+        ACCENT = "#e94560"
+        TEXT = "#eaeaea"
+        TEXT_DIM = "#8892a0"
+
+        root = tk.Tk()
+        root.title("WhisperO — First-Time Setup")
+        root.configure(bg=BG)
+        root.resizable(False, False)
+
+        w, h = 480, 220
+        x = (root.winfo_screenwidth() - w) // 2
+        y = (root.winfo_screenheight() - h) // 2
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.attributes("-topmost", True)
+
+        # Model sizes (approximate download)
+        _MODEL_SIZES = {
+            "large-v3": "~3 GB", "medium": "~1.5 GB", "small": "~500 MB",
+            "base": "~150 MB", "tiny": "~75 MB",
+        }
+        size_str = _MODEL_SIZES.get(model_name, "several GB")
+
+        info = tk.Label(
+            root,
+            text=f"WhisperO needs to download the {model_name} model\n"
+                 f"({size_str}) for speech recognition.\n\n"
+                 f"This is a one-time download.",
+            font=("Segoe UI", 11), bg=BG, fg=TEXT, justify=tk.CENTER,
+        )
+        info.pack(pady=(20, 10))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress_bar = ttk.Progressbar(root, variable=progress_var, maximum=100, length=400)
+        status_label = tk.Label(root, text="", font=("Segoe UI", 9), bg=BG, fg=TEXT_DIM)
+
+        _cancel_flag = [False]
+
+        def on_download():
+            info.pack_forget()
+            btn_frame.pack_forget()
+            progress_bar.pack(pady=(30, 5))
+            status_label.pack()
+            status_label.configure(text="Connecting...")
+            root.geometry(f"{w}x{180}+{x}+{y}")
+
+            def _do_download():
+                try:
+                    from .transcribe import download_model
+
+                    def progress(downloaded, total):
+                        if _cancel_flag[0]:
+                            raise InterruptedError("Cancelled")
+                        if total > 0:
+                            pct = downloaded / total * 100
+                            dl_mb = downloaded / 1024 / 1024
+                            tot_mb = total / 1024 / 1024
+                            root.after(0, lambda: progress_var.set(pct))
+                            root.after(0, lambda: status_label.configure(
+                                text=f"{dl_mb:.0f} / {tot_mb:.0f} MB ({pct:.0f}%)"
+                            ))
+
+                    def status(msg):
+                        root.after(0, lambda: status_label.configure(
+                            text=msg, fg=TEXT_DIM,
+                        ))
+
+                    download_model(model_name, progress_callback=progress,
+                                   status_callback=status)
+                    result[0] = True
+                    print(f"  Model {model_name} downloaded successfully")
+                    root.after(0, root.destroy)
+                except InterruptedError:
+                    root.after(0, root.destroy)
+                except Exception as e:
+                    print(f"  Download error: {e}")
+                    root.after(0, lambda: status_label.configure(
+                        text=f"Failed: {e}", fg="#ff6b6b",
+                    ))
+
+            threading.Thread(target=_do_download, daemon=True).start()
+
+        def on_skip():
+            root.destroy()
+
+        def on_close():
+            _cancel_flag[0] = True
+            root.destroy()
+
+        root.protocol("WM_DELETE_WINDOW", on_close)
+
+        btn_frame = tk.Frame(root, bg=BG)
+        btn_frame.pack(pady=10)
+
+        tk.Button(
+            btn_frame, text="Download", font=("Segoe UI", 10, "bold"),
+            bg=ACCENT, fg="white", activebackground="#c73a52", activeforeground="white",
+            relief=tk.FLAT, padx=20, pady=5, cursor="hand2",
+            command=on_download,
+        ).pack(side=tk.LEFT, padx=8)
+
+        tk.Button(
+            btn_frame, text="Skip (use server)", font=("Segoe UI", 10),
+            bg="#2a2a4a", fg=TEXT_DIM, activebackground="#3a3a5a", activeforeground=TEXT,
+            relief=tk.FLAT, padx=20, pady=5, cursor="hand2",
+            command=on_skip,
+        ).pack(side=tk.LEFT, padx=8)
+
+        root.mainloop()
+
+    _run()
+    return result[0]
 
 
 def _download_model_and_exit() -> None:
@@ -1366,21 +1532,29 @@ def main() -> None:
         model_name = config.get("model", "large-v3")
         print(f"WhisperO (local, model: {model_name})")
 
-        def _load_model_bg():
-            try:
-                from .transcribe import get_model, is_model_cached
-                if not is_model_cached(model_name):
-                    print("  Downloading model (this may take a few minutes)...")
-                else:
-                    print("  Loading model...")
-                device_pref = config.get("device", "gpu")
-                get_model(model_name, device_pref=device_pref)
-                print("  Model ready (hotkey active)")
-            except Exception as e:
-                print(f"  ❌ Model loading failed ({e}), falling back to server mode")
+        # First launch: show download dialog if model isn't cached
+        from .transcribe import is_model_cached
+        if not is_model_cached(model_name):
+            downloaded = _open_model_download_dialog(model_name)
+            if not downloaded:
+                # User skipped — fall back to server mode for this session
+                print("  Model not downloaded, using server mode")
                 config["backend"] = "server"
+                backend = "server"
 
-        threading.Thread(target=_load_model_bg, daemon=True).start()
+        if backend == "local":
+            def _load_model_bg():
+                try:
+                    from .transcribe import get_model
+                    print("  Loading model...")
+                    device_pref = config.get("device", "gpu")
+                    get_model(model_name, device_pref=device_pref)
+                    print("  Model ready (hotkey active)")
+                except Exception as e:
+                    print(f"  Model loading failed ({e}), falling back to server mode")
+                    config["backend"] = "server"
+
+            threading.Thread(target=_load_model_bg, daemon=True).start()
     if backend == "server":
         print(f"WhisperO (server: {config['server']})")
         try:
