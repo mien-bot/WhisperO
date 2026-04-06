@@ -32,7 +32,12 @@ Thumbs.db
 # Runtime config/user data
 *.log
 
+# Exported model files (hosted on GitHub Releases)
+models/
+
+# Claude Code
+.claude/
+
 # Drafts
 icon_drafts/
-build/lib/
 build/lib/
