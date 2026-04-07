@@ -116,6 +116,11 @@ class _HotkeyListener:
         self._recording_active = False
 
     def start(self):
+        # Stop any lingering listener so we never have two Windows keyboard
+        # hooks installed simultaneously (that causes the hook to misbehave
+        # and, on Windows, can hard-crash the process when a key is pressed).
+        self.stop()
+
         self.trigger_names = get_trigger_key_names()
         self._held_names = set()
         self._recording_active = False
@@ -144,14 +149,31 @@ class _HotkeyListener:
             except Exception as e:
                 print(f"  ❌ Hotkey release error: {e}")
 
-        self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-        self.listener.daemon = True
-        self.listener.start()
+        try:
+            self.listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            self.listener.daemon = True
+            self.listener.start()
+        except Exception as e:
+            print(f"  ❌ Failed to start hotkey listener: {e}")
+            self.listener = None
 
     def stop(self):
-        if self.listener:
-            self.listener.stop()
-            self.listener = None
+        listener = self.listener
+        self.listener = None
+        if listener:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+            # Wait for pynput's internal thread to finish uninstalling the
+            # Windows keyboard hook before we install a new one.  Without
+            # this join, start() can install the new hook while the old
+            # hook is still live, which on Windows causes the process to
+            # die on the next keypress.
+            try:
+                listener.join(timeout=2)
+            except Exception:
+                pass
 
     def restart(self):
         self.stop()
@@ -214,9 +236,11 @@ def _open_hotkey_dialog(tray_icon=None):
     def _run():
         import tkinter as tk
 
-        # Pause the global hotkey listener so keypresses go to the dialog only
-        if _hotkey_listener.listener:
-            _hotkey_listener.listener.stop()
+        # Pause the global hotkey listener so keypresses go to the dialog
+        # only.  Use stop() (not listener.stop()) so the reference is
+        # cleared and the pynput thread is properly joined — otherwise a
+        # stale hook can conflict with the new hook when we restart.
+        _hotkey_listener.stop()
 
         is_mac = platform.system() == "Darwin"
 
@@ -335,9 +359,25 @@ def _open_hotkey_dialog(tray_icon=None):
         tmp.start()
 
         def _cleanup_and_close():
-            tmp.stop()
-            root.destroy()
-            _hotkey_listener.start()
+            try:
+                tmp.stop()
+                try:
+                    tmp.join(timeout=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            # Restart the main listener from a fresh background thread —
+            # not this tkinter dialog thread, which is about to exit.
+            # Installing a Windows keyboard hook from a thread that's
+            # immediately going away has caused crashes in the past.
+            threading.Thread(
+                target=_hotkey_listener.start, daemon=True, name="hotkey-restart",
+            ).start()
 
         def save():
             if best:
@@ -1560,9 +1600,46 @@ def _open_model_download_dialog(model_name: str) -> bool:
 
 
 def _check_cuda_available() -> bool:
-    """Check if CUDA libraries are loadable."""
+    """Check if CUDA libraries are loadable.
+
+    Tries the executable's directory first (so users who manually drop
+    CUDA DLLs into the WhisperO install folder are detected), then falls
+    back to the default Windows DLL search path.
+    """
+    import ctypes
+    import os
+    import sys
+
+    candidates = ["cublas64_12.dll", "cudart64_12.dll", "cublasLt64_12.dll"]
+
+    # Search dirs: app dir first, then PyInstaller _internal, then frozen sys.path
+    search_dirs = []
+    if getattr(sys, "frozen", False):
+        app_dir = os.path.dirname(sys.executable)
+        search_dirs.append(app_dir)
+        internal = os.path.join(app_dir, "_internal")
+        if os.path.isdir(internal):
+            search_dirs.append(internal)
+    else:
+        search_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+
+    for d in search_dirs:
+        full_path = os.path.join(d, "cublas64_12.dll")
+        if os.path.exists(full_path):
+            try:
+                # Add dir so dependent CUDA DLLs (cudart, cublasLt) can be found
+                if hasattr(os, "add_dll_directory"):
+                    try:
+                        os.add_dll_directory(d)
+                    except (OSError, FileNotFoundError):
+                        pass
+                ctypes.CDLL(full_path)
+                return True
+            except OSError as e:
+                print(f"  Found {full_path} but failed to load: {e}")
+
+    # Fallback: default DLL search (PATH, system32, etc.)
     try:
-        import ctypes
         ctypes.cdll.LoadLibrary("cublas64_12.dll")
         return True
     except OSError:
@@ -1684,6 +1761,17 @@ def _download_model_and_exit() -> None:
 def main() -> None:
     if "--download-model" in sys.argv:
         _download_model_and_exit()
+
+    # Installer post-install: reset device preference to GPU so a
+    # fresh install always starts on GPU, even if the user previously
+    # had device=cpu saved from a past CUDA-missing session.
+    if "--reset-device-gpu" in sys.argv:
+        try:
+            save_config_value("device", "gpu")
+            print("Device preference reset to GPU.")
+        except Exception as e:
+            print(f"Failed to reset device: {e}")
+        sys.exit(0)
 
     backend = config.get("backend", "local")
 

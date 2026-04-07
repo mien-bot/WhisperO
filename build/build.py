@@ -248,7 +248,8 @@ def build_pyinstaller() -> None:
         remove_entry_script()
 
     # Remove large CUDA DLLs — users can drop them in manually for GPU support
-    if system == "Windows":
+    # Skip stripping when --cuda is passed (build the GPU-included variant).
+    if system == "Windows" and "--cuda" not in sys.argv:
         app_dir = DIST / APP_NAME / "_internal"
         removed = 0
         for pattern in ["cublas64_*.dll", "cublasLt64_*.dll"]:
@@ -259,6 +260,8 @@ def build_pyinstaller() -> None:
                 print(f"  ✓ Removed {dll.name} ({size_mb:.0f} MB) — not needed for CPU mode")
         if removed:
             print(f"  ✓ Saved {removed:.0f} MB (drop CUDA DLLs into install folder for GPU)")
+    elif system == "Windows":
+        print("  ✓ Keeping CUDA DLLs (--cuda variant)")
 
     if system == "Darwin":
         app_path = DIST / f"{APP_NAME}.app"
@@ -352,8 +355,12 @@ def build_installer() -> None:
         sys.exit(1)
 
     print("\n  Building Windows installer...")
-    run([iscc, str(iss)], cwd=str(SCRIPT_DIR))
-    print(f"\n  ✅ Installer: dist/WhisperO-Setup.exe")
+    iscc_args = [iscc, str(iss)]
+    if "--cuda" in sys.argv:
+        iscc_args += [f"/O{DIST}", "/FWhisperO-Setup-CUDA"]
+    run(iscc_args, cwd=str(SCRIPT_DIR))
+    out_name = "WhisperO-Setup-CUDA.exe" if "--cuda" in sys.argv else "WhisperO-Setup.exe"
+    print(f"\n  ✅ Installer: dist/{out_name}")
 
 
 def main() -> None:

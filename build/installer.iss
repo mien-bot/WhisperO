@@ -49,16 +49,109 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startupicon
 
-[InstallDelete]
-; Clean out old version files before installing new ones
-Type: filesandordirs; Name: "{app}\*"
+; NOTE: No wholesale [InstallDelete] of {app}\* — that would erase any
+; CUDA DLLs (cublas64_12.dll, cublasLt64_12.dll, cudart64_12.dll, ...)
+; the user placed into the folder for GPU support. We rely on the
+; `ignoreversion` flag in [Files] to overwrite updated files, and use
+; BackupCudaDLLs / RestoreCudaDLLs in [Code] to preserve user-placed
+; CUDA libs across reinstalls.
 
 [Run]
+; Reset device preference to GPU (fresh installs always default to GPU;
+; overrides any previous device=cpu saved from a past CUDA-missing session).
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--reset-device-gpu"; Flags: waituntilterminated runhidden
 ; Download the whisper model after install (shown in a console window so user sees progress)
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--download-model"; StatusMsg: "Downloading speech recognition model (~3 GB, this may take a few minutes)..."; Flags: waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+var
+  CudaBackupDir: String;
+
+// CUDA DLL filenames users drop into the app folder for GPU support.
+// These must survive reinstall/upgrade.
+function GetCudaDllList(): TArrayOfString;
+var
+  L: TArrayOfString;
+begin
+  SetArrayLength(L, 6);
+  L[0] := 'cublas64_12.dll';
+  L[1] := 'cublasLt64_12.dll';
+  L[2] := 'cudart64_12.dll';
+  L[3] := 'cudnn_ops_infer64_8.dll';
+  L[4] := 'cudnn_cnn_infer64_8.dll';
+  L[5] := 'cudnn64_8.dll';
+  Result := L;
+end;
+
+procedure BackupCudaDLLs();
+var
+  AppDir, SrcPath, DstPath: String;
+  CudaDLLs: TArrayOfString;
+  I: Integer;
+begin
+  AppDir := ExpandConstant('{app}');
+  if not DirExists(AppDir) then Exit;
+
+  CudaBackupDir := ExpandConstant('{tmp}') + '\whispero_cuda_backup';
+  ForceDirectories(CudaBackupDir);
+
+  CudaDLLs := GetCudaDllList();
+  for I := 0 to GetArrayLength(CudaDLLs) - 1 do
+  begin
+    // Check both {app}\ and {app}\_internal\ for manually-placed DLLs
+    SrcPath := AppDir + '\' + CudaDLLs[I];
+    if FileExists(SrcPath) then
+    begin
+      DstPath := CudaBackupDir + '\' + CudaDLLs[I];
+      FileCopy(SrcPath, DstPath, False);
+    end;
+    SrcPath := AppDir + '\_internal\' + CudaDLLs[I];
+    if FileExists(SrcPath) then
+    begin
+      DstPath := CudaBackupDir + '\_internal_' + CudaDLLs[I];
+      FileCopy(SrcPath, DstPath, False);
+    end;
+  end;
+end;
+
+procedure RestoreCudaDLLs();
+var
+  AppDir, SrcPath, DstPath: String;
+  CudaDLLs: TArrayOfString;
+  I: Integer;
+begin
+  if CudaBackupDir = '' then Exit;
+  if not DirExists(CudaBackupDir) then Exit;
+
+  AppDir := ExpandConstant('{app}');
+  CudaDLLs := GetCudaDllList();
+  for I := 0 to GetArrayLength(CudaDLLs) - 1 do
+  begin
+    // Only restore if the reinstall didn't already put one there
+    // (don't clobber a DLL the new installer shipped).
+    SrcPath := CudaBackupDir + '\' + CudaDLLs[I];
+    DstPath := AppDir + '\' + CudaDLLs[I];
+    if FileExists(SrcPath) and (not FileExists(DstPath)) then
+      FileCopy(SrcPath, DstPath, False);
+
+    SrcPath := CudaBackupDir + '\_internal_' + CudaDLLs[I];
+    DstPath := AppDir + '\_internal\' + CudaDLLs[I];
+    if FileExists(SrcPath) and (not FileExists(DstPath)) then
+      FileCopy(SrcPath, DstPath, False);
+  end;
+
+  DelTree(CudaBackupDir, True, True, True);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssInstall then
+    BackupCudaDLLs()
+  else if CurStep = ssPostInstall then
+    RestoreCudaDLLs();
+end;
+
 function CheckInternet(): Boolean;
 var
   WinHttpReq: Variant;
