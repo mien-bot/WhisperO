@@ -71,22 +71,31 @@ _mel_filterbank: np.ndarray | None = None
 
 
 def _compute_fbank(audio: np.ndarray) -> np.ndarray:
-    """Compute 80-bin log-Mel filterbank features from raw float32 audio.
+    """Compute 80-bin log-Mel filterbank features matching SpeechBrain's Fbank.
 
-    Returns (time_frames, 80) float32 array matching SpeechBrain's Fbank output.
+    The ONNX ECAPA-TDNN model was trained on SpeechBrain's Fbank output, so
+    this function must reproduce it closely or embeddings are unusable:
+      STFT(Hamming, center=True, constant/zero pad) -> |x|^2 -> triangular
+      Mel filterbank -> 10*log10(max(x, 1e-10)) with 80 dB dynamic-range clip.
+
+    Returns (time_frames, 80) float32.
     """
     global _mel_filterbank
     if _mel_filterbank is None:
         _mel_filterbank = _create_mel_filterbank()
 
-    # Pad audio to fill last frame
-    pad_amount = N_FFT - (len(audio) % HOP_LENGTH)
-    if pad_amount > 0:
-        audio = np.pad(audio, (0, pad_amount), mode="constant")
+    # center=True equivalent: zero-pad n_fft//2 samples on each side so the
+    # first frame is centered on sample 0.  SpeechBrain's STFT uses
+    # pad_mode='constant' (not reflect), so we match that.
+    audio = np.pad(audio, (N_FFT // 2, N_FFT // 2), mode="constant")
 
-    # STFT using numpy
-    window = np.hanning(N_FFT).astype(np.float32)
+    # Hamming window (SpeechBrain's default; not Hanning).
+    window = np.hamming(N_FFT).astype(np.float32)
+
     n_frames = 1 + (len(audio) - N_FFT) // HOP_LENGTH
+    if n_frames < 1:
+        return np.zeros((0, N_MELS), dtype=np.float32)
+
     frames = np.lib.stride_tricks.as_strided(
         audio,
         shape=(n_frames, N_FFT),
@@ -94,13 +103,17 @@ def _compute_fbank(audio: np.ndarray) -> np.ndarray:
     )
     windowed = frames * window
     spectrum = np.fft.rfft(windowed, n=N_FFT)
-    power = np.abs(spectrum) ** 2
+    power = (np.abs(spectrum) ** 2).astype(np.float32)
 
     # Apply Mel filterbank
     mel_spec = power @ _mel_filterbank.T  # (time, n_mels)
 
-    # Log with floor to avoid log(0)
-    log_mel = np.log(np.maximum(mel_spec, 1e-10))
+    # 10 * log10 with amin floor, then clamp to an 80 dB dynamic range
+    # relative to the per-utterance max.  This matches SpeechBrain's
+    # Filterbank(log_mel=True, multiplier=10, amin=1e-10, top_db=80).
+    log_mel = 10.0 * np.log10(np.maximum(mel_spec, 1e-10))
+    max_val = log_mel.max()
+    log_mel = np.maximum(log_mel, max_val - 80.0)
 
     return log_mel.astype(np.float32)
 
@@ -135,7 +148,7 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 # ── Segment merging ─────────────────────────────────────────────────────
 
-_MIN_EMBED_SECS = 1.5   # minimum audio for a reliable voice embedding
+_MIN_EMBED_SECS = 0.75  # minimum audio for a reliable voice embedding
 _TURN_GAP_SECS = 0.8    # merge segments within this gap into one turn
 _CENTROID_MAX_WEIGHT = 20  # cap running-mean weight so centroids stay adaptive
 

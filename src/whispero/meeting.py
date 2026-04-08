@@ -25,10 +25,13 @@ from .transcribe import transcribe_meeting_segment, transcription_lock
 # thread can never balloon RAM.
 _MAX_RING_CHUNKS = 320
 
-# Silence-aware segmentation tuning
+# Silence-aware segmentation tuning.  Whisper accuracy drops sharply on
+# very short clips (<2s), so we require a meaningful amount of audio before
+# flushing even when a natural pause is detected.  This trades a small
+# amount of latency for parity with push-to-talk transcription quality.
 _POLL_INTERVAL_SECS = 0.25        # how often the segment loop wakes up
-_MIN_SEGMENT_SECS = 0.8           # don't emit segments shorter than this
-_SILENCE_FLUSH_MS = 500           # trailing silence that triggers a flush
+_MIN_SEGMENT_SECS = 2.5           # don't emit segments shorter than this
+_SILENCE_FLUSH_MS = 700           # trailing silence that triggers a flush
 
 
 def _find_cut_point(
@@ -298,7 +301,15 @@ class MeetingRecorder:
                 speech_ts = None
 
             force = accum_len >= max_samples
-            cut = _find_cut_point(len(audio_float), speech_ts, silence_samples, force)
+            # Don't allow cuts until we've accumulated at least min_samples of
+            # audio.  Otherwise a short utterance (e.g. 1s of speech followed
+            # by silence) would be flushed as a tiny clip that Whisper
+            # transcribes poorly.  Small sub-pauses inside a 2.5s window get
+            # absorbed into a single segment instead of fragmenting output.
+            if accum_len < min_samples and not force:
+                cut = None
+            else:
+                cut = _find_cut_point(len(audio_float), speech_ts, silence_samples, force)
 
             if cut is None:
                 # Wait for more audio / a natural pause
