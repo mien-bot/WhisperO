@@ -183,6 +183,10 @@ class SpeakerDiarizer:
         # Running centroids for the entire meeting
         self._centroids: list[np.ndarray] = []
         self._centroid_counts: list[int] = []
+        # Persist last-assigned speaker across calls so a short utterance
+        # at the start of a new segment inherits the most recent speaker
+        # instead of defaulting back to speaker 0.
+        self._last_assigned: int = 0
 
         if not ONNX_PATH.exists():
             raise DiarizationModelNotFound(
@@ -266,19 +270,20 @@ class SpeakerDiarizer:
     ) -> list[int]:
         """Assign speakers to turns, handling short turns by temporal fallback."""
         speaker_ids: list[int] = []
-        last_assigned = 0  # fallback for short / silent turns
 
         for emb in embeddings:
             if emb is None or np.allclose(emb, 0):
-                # Short turn — inherit the most recent speaker
-                speaker_ids.append(last_assigned)
+                # Short turn — inherit the most recent speaker (persistent
+                # across calls so a brief utterance at the start of a new
+                # segment doesn't snap back to speaker 0).
+                speaker_ids.append(self._last_assigned)
                 continue
 
             if not self._centroids:
                 self._centroids.append(emb.copy())
                 self._centroid_counts.append(1)
                 speaker_ids.append(0)
-                last_assigned = 0
+                self._last_assigned = 0
                 continue
 
             similarities = [_cosine_similarity(emb, c) for c in self._centroids]
@@ -293,17 +298,17 @@ class SpeakerDiarizer:
                 ) / (n + 1)
                 self._centroid_counts[best_idx] += 1
                 speaker_ids.append(best_idx)
-                last_assigned = best_idx
+                self._last_assigned = best_idx
             elif len(self._centroids) < self._max_speakers:
                 # New speaker
                 new_idx = len(self._centroids)
                 self._centroids.append(emb.copy())
                 self._centroid_counts.append(1)
                 speaker_ids.append(new_idx)
-                last_assigned = new_idx
+                self._last_assigned = new_idx
             else:
                 # At speaker limit — assign to closest
                 speaker_ids.append(best_idx)
-                last_assigned = best_idx
+                self._last_assigned = best_idx
 
         return speaker_ids

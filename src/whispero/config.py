@@ -18,8 +18,8 @@ DEFAULTS = {
     "sounds": True,
     "start_sound": "start",
     "stop_sound": "stop",
-    "meeting_segment_duration": 10,    # seconds per segment
-    "meeting_overlap": 0.5,            # overlap between segments (avoid cut words)
+    "meeting_segment_duration": 10,    # max seconds before force-flushing a segment
+                                       # (normally segments are cut at natural silences)
     "meeting_auto_open": True,         # open transcript when meeting stops
     "meeting_audio_source": "mic",     # "mic", "system", or "both"
     "meeting_diarization": False,      # speaker identification (requires speechbrain)

@@ -21,9 +21,53 @@ from .transcribe import transcribe_meeting_segment, transcription_lock
 
 # Max chunks the ring buffer will hold before silently dropping old audio.
 # ~20s at 16 kHz / 1024 blocksize ≈ 312 chunks.  Generous enough for a
-# 10s segment + overlap + timing jitter, but bounded so a stalled segment
+# max-length segment + timing jitter, but bounded so a stalled segment
 # thread can never balloon RAM.
 _MAX_RING_CHUNKS = 320
+
+# Silence-aware segmentation tuning
+_POLL_INTERVAL_SECS = 0.25        # how often the segment loop wakes up
+_MIN_SEGMENT_SECS = 0.8           # don't emit segments shorter than this
+_SILENCE_FLUSH_MS = 500           # trailing silence that triggers a flush
+
+
+def _find_cut_point(
+    total_samples: int,
+    speech_ts: list[dict] | None,
+    silence_samples: int,
+    force: bool,
+) -> int | None:
+    """Decide where to split an accumulated audio buffer.
+
+    Returns a sample index up to which we should flush, or None to wait
+    for more audio.  Preferred cut: just after the last speech region
+    when it's followed by ≥ silence_samples of silence.  If the buffer
+    is too long (force=True), cut at the largest internal silence gap
+    or, failing that, flush the whole buffer.
+    """
+    if not speech_ts:
+        return total_samples if force else None
+
+    last_end = speech_ts[-1]["end"]
+    tail_silence = total_samples - last_end
+    if tail_silence >= silence_samples:
+        # Cut a little past the end of speech so we don't clip the final word
+        return min(total_samples, last_end + silence_samples // 2)
+
+    if not force:
+        return None
+
+    best_cut = None
+    best_gap = 0
+    for i in range(len(speech_ts) - 1):
+        gap = speech_ts[i + 1]["start"] - speech_ts[i]["end"]
+        if gap >= silence_samples and gap > best_gap:
+            best_gap = gap
+            best_cut = speech_ts[i]["end"] + gap // 2
+    if best_cut is not None:
+        return best_cut
+
+    return total_samples
 
 
 class MeetingRecorder:
@@ -33,21 +77,23 @@ class MeetingRecorder:
         self,
         session: MeetingSession,
         device_index: int | None = None,
-        segment_duration: int = 10,
-        overlap: float = 0.5,
+        max_segment_duration: int = 15,
         audio_source: str = "mic",
     ):
         self._session = session
         self._device_index = device_index
-        self._segment_duration = segment_duration
-        self._overlap = overlap
+        self._max_segment_duration = max_segment_duration
         self._audio_source = audio_source  # "mic", "system", or "both"
 
-        # Audio buffering — bounded ring buffer
-        self._chunk_buffer: collections.deque[np.ndarray] = collections.deque(
+        # Per-source ring buffers — kept separate so mic + system audio
+        # can be sample-aligned and mixed rather than arbitrarily
+        # interleaved.
+        self._mic_buffer: collections.deque[np.ndarray] = collections.deque(
             maxlen=_MAX_RING_CHUNKS,
         )
-        self._overlap_chunks: list[np.ndarray] = []
+        self._sys_buffer: collections.deque[np.ndarray] = collections.deque(
+            maxlen=_MAX_RING_CHUNKS,
+        )
         self._segment_queue: queue.Queue = queue.Queue(maxsize=20)
 
         # Lifecycle
@@ -56,9 +102,6 @@ class MeetingRecorder:
         self._segment_thread: threading.Thread | None = None
         self._transcribe_thread: threading.Thread | None = None
 
-        # Timestamp tracking — cumulative new-audio time (excludes overlap)
-        self._cumulative_new_seconds = 0.0
-
     def start(self) -> None:
         self._running = True
         self._stop_event.clear()
@@ -66,20 +109,20 @@ class MeetingRecorder:
         source = self._audio_source
         if source in ("mic", "both"):
             stream = get_shared_stream(self._device_index)
-            stream.add_consumer("meeting", self._on_audio)
+            stream.add_consumer("meeting", self._on_mic_audio)
             print(f"  Meeting: mic capture active")
 
         if source in ("system", "both"):
             if LoopbackStream.is_available():
                 loopback = get_loopback_stream()
-                loopback.add_consumer("meeting", self._on_audio)
+                loopback.add_consumer("meeting", self._on_sys_audio)
                 print(f"  Meeting: system audio capture active")
             else:
                 print("  System audio capture unavailable (WASAPI loopback not found)")
                 if source == "system":
                     # Fall back to mic if system-only was requested but unavailable
                     stream = get_shared_stream(self._device_index)
-                    stream.add_consumer("meeting", self._on_audio)
+                    stream.add_consumer("meeting", self._on_mic_audio)
                     print(f"  Meeting: falling back to mic capture")
 
         self._segment_thread = threading.Thread(
@@ -111,94 +154,184 @@ class MeetingRecorder:
             self._transcribe_thread.join(timeout=30)
 
         # Explicit cleanup
-        self._chunk_buffer.clear()
-        self._overlap_chunks.clear()
+        self._mic_buffer.clear()
+        self._sys_buffer.clear()
         gc.collect()
         print("  Meeting recorder stopped")
 
-    # ── SharedStream consumer callback ──────────────────────────────────
+    # ── Stream consumer callbacks ───────────────────────────────────────
 
-    def _on_audio(self, indata: np.ndarray) -> None:
+    def _on_mic_audio(self, indata: np.ndarray) -> None:
         if self._running:
-            self._chunk_buffer.append(indata)
+            self._mic_buffer.append(indata)
+
+    def _on_sys_audio(self, indata: np.ndarray) -> None:
+        if self._running:
+            self._sys_buffer.append(indata)
+
+    def _drain_and_mix(self) -> np.ndarray | None:
+        """Drain per-source buffers and return a single int16 waveform.
+
+        With only one source, passes the audio through.  With both mic
+        and system audio active, trims to the shorter of the two, sums
+        them sample-aligned (clipping to int16), and pushes any
+        leftover samples back so the next drain stays aligned.
+        """
+        mic_chunks: list[np.ndarray] = []
+        while self._mic_buffer:
+            try:
+                mic_chunks.append(self._mic_buffer.popleft())
+            except IndexError:
+                break
+
+        sys_chunks: list[np.ndarray] = []
+        while self._sys_buffer:
+            try:
+                sys_chunks.append(self._sys_buffer.popleft())
+            except IndexError:
+                break
+
+        mic = np.concatenate(mic_chunks, axis=0) if mic_chunks else None
+        sys = np.concatenate(sys_chunks, axis=0) if sys_chunks else None
+
+        if mic is None and sys is None:
+            return None
+        if mic is None:
+            return sys
+        if sys is None:
+            return mic
+
+        n = min(len(mic), len(sys))
+        if n == 0:
+            if len(mic) > 0:
+                self._mic_buffer.appendleft(mic)
+            if len(sys) > 0:
+                self._sys_buffer.appendleft(sys)
+            return None
+
+        if len(mic) > n:
+            self._mic_buffer.appendleft(mic[n:])
+        if len(sys) > n:
+            self._sys_buffer.appendleft(sys[n:])
+
+        mixed = mic[:n].astype(np.int32) + sys[:n].astype(np.int32)
+        return np.clip(mixed, -32768, 32767).astype(np.int16)
 
     # ── Segment extraction thread ───────────────────────────────────────
 
     def _segment_loop(self) -> None:
-        while not self._stop_event.is_set():
-            self._stop_event.wait(timeout=self._segment_duration)
-            if self._stop_event.is_set():
-                break
+        """Accumulate audio and flush utterance-sized segments on silence.
 
-            # Drain chunk buffer
-            chunks: list[np.ndarray] = []
-            while self._chunk_buffer:
-                try:
-                    chunks.append(self._chunk_buffer.popleft())
-                except IndexError:
-                    break
+        Instead of fixed 10s windows, we poll every _POLL_INTERVAL_SECS,
+        append new audio to an accumulator, and run Silero VAD.  When
+        the accumulator ends with ≥ _SILENCE_FLUSH_MS of silence after
+        speech (or hits the max-length safety cap), we flush that span
+        as one segment — a natural utterance.  Each flushed segment is
+        typically one speaker's turn, which gives the diarizer clean
+        embeddings and produces transcript output much more frequently.
+        """
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
 
-            if not chunks:
-                continue
+        accum_parts: list[np.ndarray] = []
+        accum_len = 0
+        accum_start_time = 0.0
 
-            # Prepend overlap from previous segment
-            prepended_overlap = self._overlap_chunks
-            all_chunks = prepended_overlap + chunks
-            audio = np.concatenate(all_chunks, axis=0)
+        max_samples = int(self._max_segment_duration * SAMPLE_RATE)
+        min_samples = int(_MIN_SEGMENT_SECS * SAMPLE_RATE)
+        silence_samples = int((_SILENCE_FLUSH_MS / 1000.0) * SAMPLE_RATE)
 
-            # Save tail of new chunks for next segment's overlap (O(1) slice)
-            overlap_samples = int(self._overlap * SAMPLE_RATE)
-            total = 0
-            split_idx = len(chunks)
-            for i in range(len(chunks) - 1, -1, -1):
-                total += len(chunks[i])
-                split_idx = i
-                if total >= overlap_samples:
-                    break
-            self._overlap_chunks = chunks[split_idx:]
+        def flush(segment_audio: np.ndarray, segment_start: float) -> None:
+            if len(segment_audio) < min_samples:
+                return
 
-            # Calculate timing: prepended overlap duration comes from the
-            # difference between total audio and new-only audio.
-            new_samples = sum(len(c) for c in chunks)
-            prepended_secs = (len(audio) - new_samples) / SAMPLE_RATE
-            segment_audio_start = max(0.0, self._cumulative_new_seconds - prepended_secs)
-            self._cumulative_new_seconds += new_samples / SAMPLE_RATE
+            seg_float = segment_audio.flatten().astype(np.float32) / 32768.0
 
-            # Free list references (numpy arrays still alive via `audio`)
-            del prepended_overlap, all_chunks, chunks
+            # Skip if the flushed window has no actual speech
+            try:
+                seg_speech = get_speech_timestamps(
+                    seg_float,
+                    vad_options=VadOptions(min_silence_duration_ms=500),
+                )
+                if not seg_speech:
+                    return
+            except Exception:
+                pass
 
-            # Create WAV buffer from int16 audio
             buf = io.BytesIO()
             with wave.open(buf, "wb") as wf:
                 wf.setnchannels(CHANNELS)
                 wf.setsampwidth(2)
                 wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(audio.tobytes())
+                wf.writeframes(segment_audio.tobytes())
             buf.seek(0)
 
-            # Convert to float32 for VAD, then free int16
-            audio_float = audio.flatten().astype(np.float32) / 32768.0
-            del audio
-
-            # Run Silero VAD — skip silence
             try:
-                from faster_whisper.vad import VadOptions, get_speech_timestamps
-
-                vad_opts = VadOptions(min_silence_duration_ms=500)
-                speech_ts = get_speech_timestamps(audio_float, vad_options=vad_opts)
-                if not speech_ts:
-                    del audio_float, buf
-                    continue  # no speech in this segment
-            except Exception as e:
-                print(f"  VAD error (transcribing anyway): {e}")
-
-            try:
-                self._segment_queue.put_nowait(
-                    (segment_audio_start, buf, audio_float)
-                )
+                self._segment_queue.put_nowait((segment_start, buf, seg_float))
             except queue.Full:
                 print("  Meeting segment queue full, dropping segment")
-                del buf, audio_float
+
+        while not self._stop_event.is_set():
+            self._stop_event.wait(timeout=_POLL_INTERVAL_SECS)
+
+            new_audio = self._drain_and_mix()
+            if new_audio is not None and len(new_audio) > 0:
+                accum_parts.append(new_audio)
+                accum_len += len(new_audio)
+
+            if accum_len == 0:
+                continue
+
+            audio = (
+                np.concatenate(accum_parts, axis=0)
+                if len(accum_parts) > 1
+                else accum_parts[0]
+            )
+            audio_float = audio.flatten().astype(np.float32) / 32768.0
+
+            try:
+                speech_ts = get_speech_timestamps(
+                    audio_float,
+                    vad_options=VadOptions(min_silence_duration_ms=_SILENCE_FLUSH_MS),
+                )
+            except Exception as e:
+                print(f"  VAD error: {e}")
+                speech_ts = None
+
+            force = accum_len >= max_samples
+            cut = _find_cut_point(len(audio_float), speech_ts, silence_samples, force)
+
+            if cut is None:
+                # Wait for more audio / a natural pause
+                accum_parts = [audio]
+                continue
+
+            cut = max(0, min(cut, len(audio)))
+            segment_audio = audio[:cut]
+            remainder = audio[cut:]
+            segment_start = accum_start_time
+            accum_start_time += cut / SAMPLE_RATE
+
+            if len(remainder) > 0:
+                accum_parts = [remainder]
+                accum_len = len(remainder)
+            else:
+                accum_parts = []
+                accum_len = 0
+
+            flush(segment_audio, segment_start)
+
+        # Final flush on stop — drain anything still pending
+        tail = self._drain_and_mix()
+        if tail is not None and len(tail) > 0:
+            accum_parts.append(tail)
+            accum_len += len(tail)
+        if accum_len > 0:
+            audio = (
+                np.concatenate(accum_parts, axis=0)
+                if len(accum_parts) > 1
+                else accum_parts[0]
+            )
+            flush(audio, accum_start_time)
 
     # ── Transcription thread ────────────────────────────────────────────
 
@@ -342,15 +475,15 @@ class MeetingSession:
         if self._running:
             return
         self._running = True
-        seg_dur = self._config.get("meeting_segment_duration", 10)
-        overlap = self._config.get("meeting_overlap", 0.5)
+        # Used as the safety cap for silence-aware flushing — if no pause
+        # is detected within this many seconds, the buffer is force-flushed.
+        max_seg_dur = self._config.get("meeting_segment_duration", 15)
 
         audio_source = self._config.get("meeting_audio_source", "mic")
         self._recorder = MeetingRecorder(
             session=self,
             device_index=self._device_index,
-            segment_duration=seg_dur,
-            overlap=overlap,
+            max_segment_duration=max_seg_dur,
             audio_source=audio_source,
         )
         self._recorder.start()
